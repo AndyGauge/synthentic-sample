@@ -1,0 +1,27 @@
+{
+  "github": {
+    "git": "git",
+    "max_lines": 120,
+    "exclude_dirs": [".git", "vendor", "node_modules", "tmp"],
+    "max_file_bytes": 1000000
+  },
+  "sentinel": { "command": "sentinel", "args": ["init"] },
+  "lsp": { "enabled": true, "command": "sentinel", "args": ["lsp"] },
+  "highlight": {
+    "enabled": true,
+    "theme": {
+      "background": "#1e2127",
+      "plain": "#abb2bf",
+      "comment": "#5c6370",
+      "keyword": "#c678dd",
+      "type": "#e5c07b",
+      "builtin": "#56b6c2",
+      "ivar": "#e06c75",
+      "function": "#61afef",
+      "punct": "#7f848e",
+      "string": "#98c379",
+      "error": "#ff6b6b",
+      "warning": "#e5c07b"
+    }
+  }
+}
