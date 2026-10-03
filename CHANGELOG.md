@@ -15,6 +15,9 @@
 - **Settings file** (`settings.json`, see `settings.example.json`): sentinel and LSP commands/args and the LSP toggle, highlight toggle and every theme colour, and the `github` options. Every field is optional. `SENTINEL_BIN` overrides the sentinel and LSP commands.
 - `examples/snapshot.rs` renders the window to raw RGBA for visual checks.
 
+### Licensing
+- Dual licensed under MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`, `license` in `Cargo.toml`).
+
 ### Known limitations
 - Needs a sentinel that transpiles trailing `attr_*` types, `# @rbs` tags and ivars. Older builds silently drop them.
 - sentinel does not attach `#:` to `private def foo` / `protected def foo`; imports annotate those methods anyway (valid inline RBS) and the warnings land in the pair's `diagnostics`.
