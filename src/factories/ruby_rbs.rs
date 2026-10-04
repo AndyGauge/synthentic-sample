@@ -12,7 +12,8 @@
 use crate::{
     Pair, PairFactory,
     lsp::LspClient,
-    factories::{rbs_reverse::{self, RbsIndex}, ruby_hunks::split_hunks},
+    factories::{rbs_reverse, ruby_hunks::split_hunks},
+    rbs::RbsIndex,
     pair::{Compiled, Diagnostic, ImportOptions, SourceFile},
     rng::{self, Rng},
     settings::{LspSettings, SentinelSettings},
@@ -89,6 +90,7 @@ impl PairFactory for RubyRbsFactory {
             instruction,
             input: class.render(None),
             output: class.render(Some(style)),
+            expected: String::new(),
             compiled: String::new(),
             compile_error: None,
             diagnostics: Vec::new(),
@@ -103,7 +105,7 @@ impl PairFactory for RubyRbsFactory {
     /// Ruby file (or hunk) that has matching signatures becomes a pair whose input
     /// is the plain Ruby and whose output is the same Ruby with inline RBS.
     /// Ruby files with no matching signatures have no ground truth and are skipped.
-    fn import_files(&self, repo: &str, files: &[SourceFile], opts: &ImportOptions) -> Vec<Pair> {
+    fn import_files(&self, label: &str, files: &[SourceFile], opts: &ImportOptions) -> Vec<Pair> {
         let mut index = RbsIndex::default();
         for f in files.iter().filter(|f| f.path.ends_with(".rbs")) {
             index.add_file(&f.text);
@@ -112,12 +114,12 @@ impl PairFactory for RubyRbsFactory {
         for f in files.iter().filter(|f| f.path.ends_with(".rb")) {
             let hunks = split_hunks(&f.text, opts.max_lines);
             for (n, hunk) in hunks.iter().enumerate() {
-                let (output, annotated) = rbs_reverse::annotate(hunk, &index);
-                if annotated == 0 {
+                let annotated = rbs_reverse::annotate(hunk, &index);
+                if annotated.count == 0 {
                     continue;
                 }
                 let suffix = if hunks.len() > 1 { format!("#{}", n + 1) } else { String::new() };
-                let id = format!("{}:gh:{repo}:{}{suffix}", self.id(), f.path);
+                let id = format!("{}:{label}:{}{suffix}", self.id(), f.path);
                 let instruction = instruction(&mut Rng::new(rng::hash64(&id)), Style::TypeComment);
                 pairs.push(Pair {
                     id,
@@ -125,7 +127,8 @@ impl PairFactory for RubyRbsFactory {
                     seed: 0,
                     instruction,
                     input: hunk.clone(),
-                    output,
+                    output: annotated.text,
+                    expected: annotated.expected,
                     compiled: String::new(),
                     compile_error: None,
                     diagnostics: Vec::new(),

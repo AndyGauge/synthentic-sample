@@ -4,11 +4,13 @@
 //! implementation (see [`factories::ruby_rbs`]). [`Store`] persists pairs as
 //! JSONL so the output can feed a training pipeline directly.
 
+pub mod collection;
 pub mod factories;
 pub mod github;
 pub mod highlight;
 pub mod lsp;
 pub mod pair;
+pub mod rbs;
 pub mod rng;
 pub mod settings;
 pub mod store;

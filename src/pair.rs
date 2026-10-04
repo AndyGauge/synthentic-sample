@@ -20,6 +20,10 @@ pub struct Pair {
     pub instruction: String,
     pub input: String,
     pub output: String,
+    /// The RBS `output` is expected to compile to (empty when there is no ground
+    /// truth, as for synthetic pairs). Imported pairs get it from the source RBS.
+    #[serde(default)]
+    pub expected: String,
     /// Output of the factory's compiler run on `output` (empty until compiled).
     #[serde(default)]
     pub compiled: String,
@@ -53,7 +57,36 @@ pub struct Compiled {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Whether a pair's compiled RBS matches what it was expected to compile to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Check {
+    /// No ground truth to compare against.
+    NotApplicable,
+    /// Not compiled yet.
+    Pending,
+    Match,
+    /// What differed, one line per member.
+    Mismatch(Vec<String>),
+}
+
 impl Pair {
+    /// Compares `compiled` against `expected`.
+    pub fn check(&self) -> Check {
+        if self.expected.is_empty() {
+            return Check::NotApplicable;
+        }
+        if let Some(e) = &self.compile_error {
+            return Check::Mismatch(vec![format!("compile failed: {}", e.lines().next().unwrap_or(""))]);
+        }
+        if self.compiled.is_empty() {
+            return Check::Pending;
+        }
+        match crate::rbs::mismatches(&self.expected, &self.compiled) {
+            m if m.is_empty() => Check::Match,
+            m => Check::Mismatch(m),
+        }
+    }
+
     pub fn make_id(factory: &str, seed: u64) -> String {
         format!("{factory}:{seed}")
     }
@@ -92,11 +125,12 @@ pub trait PairFactory: Send + Sync {
         &[]
     }
 
-    /// Builds pairs from a whole checkout (`repo` is `owner/repo@sha`): one pair
+    /// Builds pairs from a whole checkout (`label` names it, e.g. `gh:owner/repo@sha`
+    /// or `gem:name@1.2.3`): one pair
     /// per file, or per hunk when a file is longer than `opts.max_lines`. Gets
     /// every file so it can relate them (e.g. Ruby sources to their `.rbs`).
-    /// Pair ids must be unique and stable for a given repo revision.
-    fn import_files(&self, _repo: &str, _files: &[SourceFile], _opts: &ImportOptions) -> Vec<Pair> {
+    /// Pair ids must be unique and stable for a given revision.
+    fn import_files(&self, _label: &str, _files: &[SourceFile], _opts: &ImportOptions) -> Vec<Pair> {
         Vec::new()
     }
 

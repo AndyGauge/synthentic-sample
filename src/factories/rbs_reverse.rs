@@ -6,170 +6,13 @@
 //! * `attr_reader name: T`    → trailing `#: T` on `attr_reader :name`
 //! * `@name: T` (no matching attr) → `# @rbs @name: T` at the top of the class
 //!
-//! RBS is line-oriented enough that a small statement parser covers real-world
-//! `sig/` files; anything it doesn't understand (type aliases, `include`,
-//! overloaded methods, multi-symbol `attr_*` lines) is left alone.
+//! Alongside the annotated source, [`annotate`] returns the RBS those
+//! annotations are *expected* to compile to, so the result can be verified
+//! against what sentinel actually produces (see [`crate::rbs::mismatches`]).
+//! Anything not understood (type aliases, `include`, overloaded methods,
+//! multi-symbol `attr_*` lines) is left alone.
 
-use std::collections::HashMap;
-
-#[derive(Default, Debug)]
-struct ClassSigs {
-    /// (is_singleton, name) → overloads (inline `#:` can only express one).
-    methods: HashMap<(bool, String), Vec<String>>,
-    /// attribute name → type
-    attrs: HashMap<String, String>,
-    /// (`@name`, type) in declaration order
-    ivars: Vec<(String, String)>,
-}
-
-/// Signatures from any number of `.rbs` files, keyed by fully-qualified class name.
-#[derive(Default, Debug)]
-pub struct RbsIndex {
-    classes: HashMap<String, ClassSigs>,
-}
-
-fn depth(s: &str) -> i32 {
-    let (mut d, mut quoted) = (0, false);
-    for c in s.chars() {
-        match c {
-            '"' => quoted = !quoted,
-            '(' | '[' | '{' if !quoted => d += 1,
-            ')' | ']' | '}' if !quoted => d -= 1,
-            _ => {}
-        }
-    }
-    d
-}
-
-/// A statement that must continue on the next line.
-fn incomplete(s: &str) -> bool {
-    depth(s) > 0 || ["->", "|", ":", ","].iter().any(|e| s.ends_with(e))
-}
-
-/// Splits a method type into overloads: a top-level `|` followed by `(` and a
-/// later `->` is a separator; any other `|` is a union inside a type.
-fn overloads(sig: &str) -> Vec<String> {
-    let chars: Vec<char> = sig.chars().collect();
-    let (mut parts, mut start, mut d) = (Vec::new(), 0, 0);
-    for i in 0..chars.len() {
-        match chars[i] {
-            '(' | '[' | '{' => d += 1,
-            ')' | ']' | '}' => d -= 1,
-            '|' if d == 0 => {
-                let rest: String = chars[i + 1..].iter().collect();
-                let rest = rest.trim_start();
-                if rest.starts_with('(') && rest.contains("->") {
-                    parts.push(chars[start..i].iter().collect::<String>().trim().to_string());
-                    start = i + 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    parts.push(chars[start..].iter().collect::<String>().trim().to_string());
-    parts
-}
-
-impl RbsIndex {
-    pub fn is_empty(&self) -> bool {
-        self.classes.is_empty()
-    }
-
-    /// Parses one `.rbs` file into the index. Unrecognised statements are skipped.
-    pub fn add_file(&mut self, text: &str) {
-        let mut scope: Vec<String> = Vec::new();
-        let mut open: Option<String> = None; // statement still being continued
-        let mut pending: Option<String> = None; // complete, waiting to see if `|` follows
-
-        for raw in text.lines() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some(stmt) = &mut open {
-                stmt.push(' ');
-                stmt.push_str(line);
-                if !incomplete(stmt) {
-                    pending = open.take();
-                }
-                continue;
-            }
-            if line.starts_with('|') {
-                if let Some(p) = &mut pending {
-                    p.push(' ');
-                    p.push_str(line);
-                    continue;
-                }
-            }
-            if let Some(p) = pending.take() {
-                self.dispatch(&mut scope, &p);
-            }
-            if incomplete(line) {
-                open = Some(line.to_string());
-            } else {
-                pending = Some(line.to_string());
-            }
-        }
-        if let Some(p) = pending.take().or(open) {
-            self.dispatch(&mut scope, &p);
-        }
-    }
-
-    fn dispatch(&mut self, scope: &mut Vec<String>, stmt: &str) {
-        let first = stmt.split_whitespace().next().unwrap_or("");
-        let rest = stmt[first.len()..].trim();
-        match first {
-            "class" | "module" | "interface" => {
-                let name = rest
-                    .split(|c: char| c.is_whitespace() || c == '<' || c == '[')
-                    .next()
-                    .unwrap_or("");
-                let qualified = match (name.strip_prefix("::"), scope.last()) {
-                    (Some(abs), _) => abs.to_string(),
-                    (None, Some(parent)) => format!("{parent}::{name}"),
-                    (None, None) => name.to_string(),
-                };
-                self.classes.entry(qualified.clone()).or_default();
-                scope.push(qualified);
-            }
-            "end" => {
-                scope.pop();
-            }
-            _ => {
-                let Some(class) = scope.last().and_then(|c| self.classes.get_mut(c)) else { return };
-                match first {
-                    "def" => {
-                        let (singleton, rest) = match rest.strip_prefix("self.") {
-                            Some(r) => (true, r),
-                            None => (false, rest),
-                        };
-                        if let Some((name, sig)) = rest.split_once(':') {
-                            let sig = sig.trim();
-                            if !sig.is_empty() && sig != "..." {
-                                class.methods.insert((singleton, name.trim().to_string()), overloads(sig));
-                            }
-                        }
-                    }
-                    "attr_reader" | "attr_writer" | "attr_accessor" => {
-                        if let Some((name, ty)) = rest.split_once(':') {
-                            // `name (@ivar): T` — keep just the name; skip `self.name` (class-level).
-                            let name = name.split_whitespace().next().unwrap_or("");
-                            if !name.starts_with("self.") && !name.is_empty() {
-                                class.attrs.insert(name.to_string(), ty.trim().to_string());
-                            }
-                        }
-                    }
-                    s if s.starts_with('@') => {
-                        if let Some((name, ty)) = stmt.split_once(':') {
-                            class.ivars.push((name.trim().to_string(), ty.trim().to_string()));
-                        }
-                    }
-                    _ => {} // type, alias, include, extend, private, ...
-                }
-            }
-        }
-    }
-}
+use crate::rbs::RbsIndex;
 
 struct Scope {
     indent: usize,
@@ -192,12 +35,48 @@ fn single_attr(t: &str) -> Option<&str> {
     (!name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '?')).then_some(name)
 }
 
-/// Annotates `src` from `index`. Returns the new source and the number of
-/// annotations added (0 means nothing in `src` matched the RBS).
-pub fn annotate(src: &str, index: &RbsIndex) -> (String, usize) {
+/// The result of [`annotate`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct Annotated {
+    /// The source with inline annotations added.
+    pub text: String,
+    /// How many annotations were added (0: nothing in the source matched the RBS).
+    pub count: usize,
+    /// RBS declaring exactly the annotated members, grouped by fully-qualified class.
+    pub expected: String,
+}
+
+/// Members to record in `Annotated::expected`, per class, in annotation order.
+#[derive(Default)]
+struct Expected(Vec<(String, Vec<String>)>);
+
+impl Expected {
+    fn add(&mut self, class: &str, decl: String) {
+        match self.0.iter_mut().find(|(c, _)| c == class) {
+            Some((_, members)) => members.push(decl),
+            None => self.0.push((class.to_string(), vec![decl])),
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut out = String::new();
+        for (class, members) in &self.0 {
+            out.push_str(&format!("class {class}\n"));
+            for m in members {
+                out.push_str(&format!("  {m}\n"));
+            }
+            out.push_str("end\n");
+        }
+        out
+    }
+}
+
+/// Annotates `src` from `index`.
+pub fn annotate(src: &str, index: &RbsIndex) -> Annotated {
     let lines: Vec<&str> = src.lines().collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len() + 8);
     let mut stack: Vec<Scope> = Vec::new();
+    let mut expected = Expected::default();
     let mut count = 0;
 
     // The class a member currently belongs to, and whether we're inside `class << self`.
@@ -242,6 +121,7 @@ pub fn annotate(src: &str, index: &RbsIndex) -> (String, usize) {
                 for (ivar, ty) in &sigs.ivars {
                     if !sigs.attrs.contains_key(ivar.trim_start_matches('@')) {
                         out.push(format!("{}# @rbs {ivar}: {ty}", " ".repeat(member_indent)));
+                        expected.add(&qualified, format!("{ivar}: {ty}"));
                         count += 1;
                     }
                 }
@@ -255,16 +135,18 @@ pub fn annotate(src: &str, index: &RbsIndex) -> (String, usize) {
 
         // `def name` / `def self.name`, possibly behind a visibility modifier.
         let decl = ["private ", "protected ", "public "].iter().find_map(|m| t.strip_prefix(m)).unwrap_or(t);
-        if let (Some(def), Some(sigs)) = (decl.strip_prefix("def "), sigs) {
+        if let (Some(def), Some(sigs), Some(class)) = (decl.strip_prefix("def "), sigs, class.as_deref()) {
             let (singleton, def) = match def.strip_prefix("self.") {
                 Some(r) => (true, r),
                 None => (in_singleton, def),
             };
             let name: String = def.chars().take_while(|c| !matches!(c, '(' | ' ' | '\t' | ';')).collect();
             let already = out.last().is_some_and(|l| l.trim_start().starts_with("#:"));
-            if let Some([sig]) = sigs.methods.get(&(singleton, name)).map(Vec::as_slice) {
+            if let Some([sig]) = sigs.methods.get(&(singleton, name.clone())).map(Vec::as_slice) {
                 if !already {
                     out.push(format!("{}#: {sig}", " ".repeat(ind)));
+                    let recv = if singleton { "self." } else { "" };
+                    expected.add(class, format!("def {recv}{name}: {sig}"));
                     count += 1;
                 }
             }
@@ -272,9 +154,10 @@ pub fn annotate(src: &str, index: &RbsIndex) -> (String, usize) {
             continue;
         }
 
-        if let (Some(attr), Some(sigs)) = (single_attr(t), sigs) {
-            if let Some(ty) = sigs.attrs.get(attr) {
+        if let (Some(attr), Some(sigs), Some(class)) = (single_attr(t), sigs, class.as_deref()) {
+            if let Some((kind, ty)) = sigs.attrs.get(attr) {
                 out.push(format!("{line} #: {ty}"));
+                expected.add(class, format!("{kind} {attr}: {ty}"));
                 count += 1;
                 continue;
             }
@@ -285,18 +168,16 @@ pub fn annotate(src: &str, index: &RbsIndex) -> (String, usize) {
 
     let mut text = out.join("\n");
     text.push('\n');
-    (text, count)
+    Annotated { text, count, expected: expected.render() }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rbs::mismatches;
 
     const RBS: &str = "\
-# a comment
 module Shop
-  type id = Integer | String
-
   class Cart < Base
     attr_reader items: Array[String]
     attr_accessor owner (@owner_ref): String?
@@ -373,24 +254,8 @@ end
     }
 
     #[test]
-    fn parses_members() {
-        let i = index();
-        let c = &i.classes["Shop::Cart"];
-        assert_eq!(c.attrs["items"], "Array[String]");
-        assert_eq!(c.attrs["owner"], "String?");
-        assert_eq!(c.methods[&(false, "add".into())], ["(String item, ?qty: Integer) -> void"]);
-        assert_eq!(c.methods[&(true, "build".into())], ["() -> Cart"]);
-        // Union return types are not overloads; real overloads are.
-        assert_eq!(c.methods[&(false, "label".into())].len(), 1);
-        assert_eq!(c.methods[&(false, "pick".into())].len(), 2);
-        // Multi-line signatures are joined.
-        assert_eq!(c.methods[&(false, "parse".into())], ["(String, Integer) -> Hash[Symbol, String]"]);
-        assert_eq!(c.ivars, [("@count".into(), "Integer".into()), ("@items".into(), "Array[String]".into())]);
-    }
-
-    #[test]
     fn annotates_ruby() {
-        let (out, n) = annotate(RUBY, &index());
+        let a = annotate(RUBY, &index());
         let want = [
             "    attr_reader :items #: Array[String]",
             "    attr_accessor :owner #: String?",
@@ -406,35 +271,58 @@ end
             "    #: () -> (Integer | Float)\n    def total; 0; end",
         ];
         for w in want {
-            assert!(out.contains(w), "missing {w:?} in:\n{out}");
+            assert!(a.text.contains(w), "missing {w:?} in:\n{}", a.text);
         }
         // Overloads, unknown methods, and the `@items` ivar (covered by attr) get nothing.
-        assert!(!out.contains("def pick") || !out.contains("#: (Integer) -> String\n    def pick"));
-        assert!(!out.contains("# @rbs @items"));
-        assert!(!out.contains("#: () -> Integer\n    def untyped_thing"));
-        assert_eq!(n, 11, "{out}");
+        assert!(!a.text.contains("#: (Integer) -> String\n    def pick"));
+        assert!(!a.text.contains("# @rbs @items"));
+        assert!(!a.text.contains("#: () -> Integer\n    def untyped_thing"));
+        assert_eq!(a.count, 11, "{}", a.text);
+    }
+
+    #[test]
+    fn expected_rbs_describes_exactly_the_annotated_members() {
+        let a = annotate(RUBY, &index());
+        assert!(a.expected.starts_with("class Shop::Cart\n"), "{}", a.expected);
+        for line in [
+            "  attr_reader items: Array[String]",
+            "  attr_accessor owner: String?",
+            "  @count: Integer",
+            "  def initialize: (?Integer) -> void",
+            "  def self.build: () -> Cart",
+            "  def ==: (untyped) -> bool",
+        ] {
+            assert!(a.expected.contains(line), "missing {line:?} in:\n{}", a.expected);
+        }
+        // Not annotated, so not expected.
+        assert!(!a.expected.contains("pick") && !a.expected.contains("@items"));
+        assert_eq!(a.expected.lines().count(), 1 + a.count + 1);
+        // And it is a faithful subset of the original RBS.
+        assert_eq!(mismatches(&a.expected, RBS), Vec::<String>::new());
     }
 
     #[test]
     fn nothing_matches_means_zero() {
-        let (out, n) = annotate("class Other\n  def x\n  end\nend\n", &index());
-        assert_eq!(n, 0);
-        assert_eq!(out, "class Other\n  def x\n  end\nend\n");
+        let a = annotate("class Other\n  def x\n  end\nend\n", &index());
+        assert_eq!(a.count, 0);
+        assert_eq!(a.text, "class Other\n  def x\n  end\nend\n");
+        assert_eq!(a.expected, "");
     }
 
     #[test]
     fn singleton_class_body_uses_singleton_sigs() {
         let mut i = RbsIndex::default();
         i.add_file("class A\n  def self.make: () -> A\nend\n");
-        let (out, n) = annotate("class A\n  class << self\n    def make\n    end\n  end\nend\n", &i);
-        assert_eq!(n, 1, "{out}");
-        assert!(out.contains("    #: () -> A\n    def make"));
+        let a = annotate("class A\n  class << self\n    def make\n    end\n  end\nend\n", &i);
+        assert_eq!(a.count, 1, "{}", a.text);
+        assert!(a.text.contains("    #: () -> A\n    def make"));
+        assert_eq!(a.expected, "class A\n  def self.make: () -> A\nend\n");
     }
 
     #[test]
     fn annotating_twice_adds_nothing_new_to_methods() {
-        let (once, _) = annotate(RUBY, &index());
-        let (twice, _) = annotate(&once, &index());
+        let once = annotate(RUBY, &index()).text;
+        let twice = annotate(&once, &index()).text;
         assert_eq!(twice.matches("def initialize").count(), 1);
         assert_eq!(twice.matches("#: (?Integer) -> void").count(), 1);
     }

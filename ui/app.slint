@@ -1,8 +1,10 @@
-import { Button, ComboBox, LineEdit, TextEdit, ListView, ScrollView } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, TextEdit, ListView, ScrollView } from "std-widgets.slint";
 
 export struct Row {
     id: string,
     summary: string,
+    /// 0 none, 1 compiled RBS matches the source, 2 mismatch, 3 compiling.
+    verdict: int,
 }
 
 export struct Seg {
@@ -36,6 +38,12 @@ export component App inherits Window {
     in property <bool> compile-failed;
     in property <bool> compiling;
     in property <int> pending-compiles;
+    in property <bool> has-selection;
+    in property <string> counts-text;
+    in property <string> verdict-text;
+    in property <color> verdict-color: #888;
+    in property <[Diag]> mismatch-lines;
+    in-out property <bool> only-mismatches;
     in property <bool> importing;
     in-out property <string> repo-text;
     in property <[Line]> compiled-lines;
@@ -55,6 +63,8 @@ export component App inherits Window {
     callback output-edited(string);
     callback recompile();
     callback import-repo(string);
+    callback sync-collection();
+    callback filter-changed();
 
     HorizontalLayout {
         padding: 8px;
@@ -90,7 +100,7 @@ export component App inherits Window {
             HorizontalLayout {
                 spacing: 6px;
                 LineEdit {
-                    placeholder-text: "owner/repo[@ref]";
+                    placeholder-text: "owner/repo, gem:name, or gems";
                     text <=> root.repo-text;
                     accepted => { root.import-repo(root.repo-text); }
                 }
@@ -101,14 +111,37 @@ export component App inherits Window {
                 }
             }
 
+            HorizontalLayout {
+                spacing: 6px;
+                Button {
+                    text: "Sync collection";
+                    enabled: !root.importing;
+                    clicked => { root.sync-collection(); }
+                }
+                CheckBox {
+                    text: "mismatches only";
+                    checked <=> root.only-mismatches;
+                    toggled => { root.filter-changed(); }
+                }
+            }
+
             ListView {
                 for row[i] in root.rows: Rectangle {
                     height: 36px;
                     background: i == root.selected ? #3d6fd8 : (touch.has-hover ? #8884 : transparent);
                     touch := TouchArea { clicked => { root.select(i); } }
-                    Text {
+                    Rectangle {
                         x: 8px;
-                        width: parent.width - 16px;
+                        y: (parent.height - self.height) / 2;
+                        width: 10px;
+                        height: 10px;
+                        border-radius: 5px;
+                        visible: row.verdict != 0;
+                        background: row.verdict == 1 ? #3fb950 : (row.verdict == 2 ? #f85149 : #8b949e);
+                    }
+                    Text {
+                        x: 24px;
+                        width: parent.width - 32px;
                         text: row.summary;
                         overflow: elide;
                         vertical-alignment: center;
@@ -118,12 +151,13 @@ export component App inherits Window {
             }
 
             Text {
-                text: root.rows.length + " pairs" + (root.pending-compiles > 0 ? " — compiling " + root.pending-compiles + "…" : "");
+                text: root.counts-text + (root.pending-compiles > 0 ? " — compiling " + root.pending-compiles + "…" : "");
                 font-size: 11px;
+                wrap: word-wrap;
             }
             Button {
                 text: "Delete selected";
-                enabled: root.selected >= 0;
+                enabled: root.has-selection;
                 clicked => { root.delete-selected(); }
             }
             Text { text: root.status; font-size: 11px; wrap: word-wrap; }
@@ -135,7 +169,7 @@ export component App inherits Window {
             Text { text: "Instruction"; font-weight: 700; }
             TextEdit {
                 height: 70px;
-                enabled: root.selected >= 0;
+                enabled: root.has-selection;
                 text <=> root.instruction;
                 edited(t) => { root.instruction-edited(t); }
             }
@@ -147,7 +181,7 @@ export component App inherits Window {
                     spacing: 4px;
                     Text { text: "Input"; font-weight: 700; }
                     TextEdit {
-                        enabled: root.selected >= 0;
+                        enabled: root.has-selection;
                         font-size: 12px;
                         text <=> root.input-text;
                         edited(t) => { root.input-edited(t); }
@@ -159,10 +193,10 @@ export component App inherits Window {
                     spacing: 4px;
                     HorizontalLayout {
                         Text { text: "Output"; font-weight: 700; horizontal-stretch: 1; }
-                        Button { text: "Recompile"; enabled: root.selected >= 0; clicked => { root.recompile(); } }
+                        Button { text: "Recompile"; enabled: root.has-selection; clicked => { root.recompile(); } }
                     }
                     TextEdit {
-                        enabled: root.selected >= 0;
+                        enabled: root.has-selection;
                         font-size: 12px;
                         text <=> root.output-text;
                         edited(t) => { root.output-edited(t); }
@@ -176,6 +210,18 @@ export component App inherits Window {
                         text: root.compile-failed ? "Compiled — ERROR" : (root.compiling ? "Compiled — compiling…" : "Compiled (sentinel → RBS)");
                         font-weight: 700;
                         color: root.compile-failed ? #d33 : black;
+                    }
+                    if root.verdict-text != "": Text {
+                        text: root.verdict-text;
+                        color: root.verdict-color;
+                        font-weight: 700;
+                        font-size: 12px;
+                    }
+                    for m in root.mismatch-lines: Text {
+                        text: m.text;
+                        color: m.color;
+                        font-size: 11px;
+                        wrap: word-wrap;
                     }
                     if root.highlight-enabled: Rectangle {
                         background: root.pane-background;
@@ -196,7 +242,7 @@ export component App inherits Window {
                         }
                     }
                     if !root.highlight-enabled: TextEdit {
-                        enabled: root.selected >= 0;
+                        enabled: root.has-selection;
                         read-only: true;
                         font-size: 12px;
                         text: root.compiled-text;

@@ -76,7 +76,7 @@ pub struct Imported {
     pub files: usize,
 }
 
-fn git(settings: &GithubSettings, args: &[&str], dir: Option<&Path>) -> Result<String, String> {
+pub(crate) fn git(settings: &GithubSettings, args: &[&str], dir: Option<&Path>) -> Result<String, String> {
     let mut cmd = Command::new(&settings.git);
     cmd.args(args)
         // Never wait on a credentials prompt, and only speak https/ssh.
@@ -110,7 +110,7 @@ pub fn import(factory: &dyn PairFactory, spec: &str, settings: &GithubSettings) 
     git(settings, &args, None)?;
     let sha = git(settings, &["rev-parse", "--short=7", "HEAD"], Some(&dest))?;
     let label = format!("{}/{}@{sha}", repo.owner, repo.name);
-    let (pairs, files) = import_dir(factory, &dest, &label, settings);
+    let (pairs, files) = import_dir(factory, &dest, &format!("gh:{label}"), settings);
     Ok(Imported { label, pairs, files })
 }
 
@@ -118,13 +118,24 @@ pub fn import(factory: &dyn PairFactory, spec: &str, settings: &GithubSettings) 
 /// the number of files read. Split out from [`import`] so it can be tested without git.
 pub fn import_dir(factory: &dyn PairFactory, root: &Path, label: &str, settings: &GithubSettings) -> (Vec<Pair>, usize) {
     let mut files = Vec::new();
-    collect(root, root, factory.import_extensions(), settings, &mut files);
+    let skip = |name: &str| settings.exclude_dirs.iter().any(|d| d == name);
+    collect(root, root, factory.import_extensions(), &skip, settings.max_file_bytes, &mut files);
     files.sort_by(|a, b| a.path.cmp(&b.path)); // deterministic order
     let pairs = factory.import_files(label, &files, &ImportOptions { max_lines: settings.max_lines });
     (pairs, files.len())
 }
 
-fn collect(root: &Path, dir: &Path, exts: &[&str], settings: &GithubSettings, out: &mut Vec<SourceFile>) {
+/// Reads files under `dir` with one of `exts` into `out` (paths relative to `root`).
+/// Directories for which `skip` returns true are not entered; symlinks, files over
+/// `max_bytes` and non-UTF-8 files are ignored.
+pub(crate) fn collect(
+    root: &Path,
+    dir: &Path,
+    exts: &[&str],
+    skip: &dyn Fn(&str) -> bool,
+    max_bytes: u64,
+    out: &mut Vec<SourceFile>,
+) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let Ok(kind) = entry.file_type() else { continue };
@@ -134,14 +145,13 @@ fn collect(root: &Path, dir: &Path, exts: &[&str], settings: &GithubSettings, ou
             continue; // never follow links out of the checkout
         }
         if kind.is_dir() {
-            if !settings.exclude_dirs.iter().any(|d| *d == name) {
-                collect(root, &path, exts, settings, out);
+            if !skip(&name) {
+                collect(root, &path, exts, skip, max_bytes, out);
             }
         } else if kind.is_file()
             && exts.iter().any(|e| name.ends_with(e))
-            && entry.metadata().is_ok_and(|m| m.len() <= settings.max_file_bytes)
+            && entry.metadata().is_ok_and(|m| m.len() <= max_bytes)
         {
-            // Non-UTF-8 files are skipped.
             if let (Ok(text), Ok(rel)) = (fs::read_to_string(&path), path.strip_prefix(root)) {
                 let path = rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
                 out.push(SourceFile { path, text });
@@ -195,7 +205,7 @@ mod tests {
         w("vendor/bundle/x.rb", "module Shop\n  class Cart\n    def add(i); end\n  end\nend\n");
         w("README.md", "ignored");
 
-        let (pairs, files) = import_dir(&RubyRbsFactory::default(), dir.path(), "a/b@abc1234", &GithubSettings::default());
+        let (pairs, files) = import_dir(&RubyRbsFactory::default(), dir.path(), "gh:a/b@abc1234", &GithubSettings::default());
         assert_eq!(files, 3, "vendor/ and README are not read");
         assert_eq!(pairs.len(), 1, "only the file with matching signatures: {pairs:#?}");
         let p = &pairs[0];
@@ -204,7 +214,7 @@ mod tests {
         assert!(p.output.contains("attr_reader :items #: Array[String]"));
         assert!(p.output.contains("#: (String) -> void\n    def add(item)"));
         // Importing again gives identical pairs (stable ids and text).
-        let (again, _) = import_dir(&RubyRbsFactory::default(), dir.path(), "a/b@abc1234", &GithubSettings::default());
+        let (again, _) = import_dir(&RubyRbsFactory::default(), dir.path(), "gh:a/b@abc1234", &GithubSettings::default());
         assert_eq!((again[0].id.clone(), again[0].output.clone(), again[0].instruction.clone()), (p.id.clone(), p.output.clone(), p.instruction.clone()));
     }
 
@@ -224,7 +234,7 @@ mod tests {
         fs::write(dir.path().join("sig/big.rbs"), &rbs).unwrap();
 
         let s = GithubSettings { max_lines: 30, ..Default::default() };
-        let (pairs, _) = import_dir(&RubyRbsFactory::default(), dir.path(), "a/b@1", &s);
+        let (pairs, _) = import_dir(&RubyRbsFactory::default(), dir.path(), "gh:a/b@1", &s);
         assert!(pairs.len() > 3, "{}", pairs.len());
         assert!(pairs[0].id.ends_with("big.rb#1"));
         // Every method is annotated exactly once across the hunks.

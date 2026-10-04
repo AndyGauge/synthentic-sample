@@ -4,12 +4,19 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     rc::Rc,
-    sync::{Arc, mpsc},
+    sync::{
+        Arc, mpsc,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::Duration,
 };
 use synthentic_sample::{
-    Pair, PairFactory, Settings, Store, github, highlight::Highlighter, pair::Compiled, registry, ui::*,
+    Pair, PairFactory, Settings, Store, collection, github,
+    highlight::Highlighter,
+    pair::{Check, Compiled},
+    registry,
+    ui::*,
 };
 
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
@@ -18,10 +25,36 @@ struct State {
     store: Store,
     factories: Vec<Arc<dyn PairFactory>>,
     factory: usize,
+    /// Index into `store.pairs`. May name a pair the filter currently hides.
     selected: Option<usize>,
     dirty: bool,
     /// Compile jobs in flight, by pair id.
     pending: HashMap<String, usize>,
+    /// `Pair::check()` per pair id, cached so refreshing the list never re-parses RBS.
+    verdicts: HashMap<String, Check>,
+    /// List row → index into `store.pairs`.
+    visible: Vec<usize>,
+    only_mismatches: bool,
+}
+
+impl State {
+    fn recheck(&mut self, id: &str) {
+        if let Some(p) = self.store.pairs.iter().find(|p| p.id == id) {
+            self.verdicts.insert(id.to_string(), p.check());
+        }
+    }
+
+    /// The list-row verdict: gray while a pair that has ground truth is compiling.
+    fn verdict_code(&self, p: &Pair) -> i32 {
+        if !p.expected.is_empty() && self.pending.contains_key(&p.id) {
+            return 3;
+        }
+        self.verdicts.get(&p.id).map_or(0, verdict_code)
+    }
+
+    fn is_mismatch(&self, p: &Pair) -> bool {
+        matches!(self.verdicts.get(&p.id), Some(Check::Mismatch(_)))
+    }
 }
 
 /// Compiles run on one background thread so the window never waits on sentinel.
@@ -38,16 +71,36 @@ struct Done {
     result: Result<Compiled, String>,
 }
 
+/// Progress from a background import / sync, applied on the UI thread.
+enum ImportMsg {
+    Status(String),
+    Pairs { label: String, pairs: Vec<Pair>, files: usize },
+    /// Everything is done; re-enables the import controls.
+    Finished(String),
+}
+
+/// What the import box was asked for.
+enum Source {
+    Repo(String),
+    /// `gem:NAME` or `gem:NAME/VERSION`
+    Gem(String),
+    AllGems,
+}
+
+fn parse_source(spec: &str) -> Source {
+    let spec = spec.trim();
+    match spec.strip_prefix("gem:") {
+        Some(g) => Source::Gem(g.trim().to_string()),
+        None if spec == "gems" => Source::AllGems,
+        None => Source::Repo(spec.to_string()),
+    }
+}
+
 /// Mirrors the in-flight compile count into the UI.
 fn sync_pending(app: &App, s: &State) {
     app.set_pending_compiles(s.pending.values().sum::<usize>() as i32);
     let selected = s.selected.and_then(|i| s.store.pairs.get(i));
     app.set_compiling(selected.is_some_and(|p| s.pending.contains_key(&p.id)));
-}
-
-fn summary(p: &synthentic_sample::Pair) -> String {
-    let first = p.input.lines().next().unwrap_or("");
-    format!("{}  {first}", p.id)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = Settings::load(&settings_path)?;
     let hl = Rc::new(Highlighter::new(&settings.highlight.theme));
     let store = Store::open(&path)?;
-    let next_seed = store.pairs.iter().map(|p| p.seed + 1).max().unwrap_or(0);
+    let next_seed = store.pairs.iter().filter(|p| p.expected.is_empty()).map(|p| p.seed + 1).max().unwrap_or(0);
 
     let app = App::new()?;
     app.set_highlight_enabled(settings.highlight.enabled);
@@ -77,10 +130,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.set_seed_text(next_seed.to_string().into());
     app.set_status(format!("{} — {} pairs loaded", path.display(), store.pairs.len()).into());
 
-    let rows = Rc::new(VecModel::from(store.pairs.iter().map(|p| Row { id: p.id.clone().into(), summary: summary(p).into() }).collect::<Vec<_>>()));
+    let verdicts = store.pairs.iter().map(|p| (p.id.clone(), p.check())).collect();
+    let rows = Rc::new(VecModel::<Row>::default());
     app.set_rows(ModelRc::from(rows.clone()));
-
-    let state = Rc::new(RefCell::new(State { store, factories, factory: 0, selected: None, dirty: false, pending: HashMap::new() }));
+    let state = Rc::new(RefCell::new(State {
+        store,
+        factories,
+        factory: 0,
+        selected: None,
+        dirty: false,
+        pending: HashMap::new(),
+        verdicts,
+        visible: Vec::new(),
+        only_mismatches: false,
+    }));
     let timer = Rc::new(Timer::default());
 
     // Restarting a running Timer resets its deadline: that is the debounce.
@@ -113,6 +176,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Rebuilds the list from the store, honouring the filter. When the visible set is
+    // unchanged only the rows that differ are touched, so scrolling isn't disturbed.
+    let refresh = {
+        let (state, rows, app) = (state.clone(), rows.clone(), app.as_weak());
+        Rc::new(move || {
+            let Some(app) = app.upgrade() else { return };
+            let mut s = state.borrow_mut();
+            let visible: Vec<usize> = (0..s.store.pairs.len())
+                .filter(|&i| !s.only_mismatches || s.is_mismatch(&s.store.pairs[i]))
+                .collect();
+            let new_rows: Vec<Row> =
+                visible.iter().map(|&i| row_for(&s.store.pairs[i], s.verdict_code(&s.store.pairs[i]))).collect();
+            if visible == s.visible {
+                for (k, row) in new_rows.into_iter().enumerate() {
+                    if rows.row_data(k).as_ref() != Some(&row) {
+                        rows.set_row_data(k, row);
+                    }
+                }
+            } else {
+                rows.set_vec(new_rows);
+                s.visible = visible;
+            }
+            let position = s.selected.and_then(|sel| s.visible.iter().position(|&i| i == sel));
+            app.set_selected(position.map_or(-1, |p| p as i32));
+            app.set_has_selection(s.selected.is_some());
+
+            let mismatched = s.store.pairs.iter().filter(|p| s.is_mismatch(p)).count();
+            let matched = s.verdicts.values().filter(|c| **c == Check::Match).count();
+            app.set_counts_text(
+                format!(
+                    "{} shown of {} pairs — {matched} match, {mismatched} mismatch",
+                    s.visible.len(),
+                    s.store.pairs.len()
+                )
+                .into(),
+            );
+        })
+    };
+    refresh();
+
     // Shows the selected pair (or clears the editor).
     let show = {
         let (state, app, hl) = (state.clone(), app.as_weak(), hl.clone());
@@ -124,31 +227,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     app.set_input_text(p.input.clone().into());
                     app.set_output_text(p.output.clone().into());
                     show_compiled(&app, p, &hl);
-                    app.set_selected(s.selected.unwrap() as i32);
                 }
                 None => {
                     app.set_instruction("".into());
                     app.set_input_text("".into());
                     app.set_output_text("".into());
                     clear_compiled(&app, &hl);
-                    app.set_selected(-1);
                 }
             }
             sync_pending(&app, &s);
         })
     };
 
-    // Adds pairs to the store and the list; returns the new ids and the duplicate count.
+    // Adds pairs to the store; returns the new ids and the duplicate count.
+    // Callers queue compiles and call `refresh` once afterwards.
     let add_pairs = {
-        let (state, rows) = (state.clone(), rows.clone());
+        let state = state.clone();
         Rc::new(move |pairs: Vec<Pair>| {
             let (mut new_ids, mut skipped) = (Vec::new(), 0);
             let mut s = state.borrow_mut();
             for pair in pairs {
-                let row = Row { id: pair.id.clone().into(), summary: summary(&pair).into() };
                 let id = pair.id.clone();
                 if s.store.add(pair) {
-                    rows.push(row);
+                    s.recheck(&id);
                     new_ids.push(id);
                 } else {
                     skipped += 1;
@@ -170,6 +271,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Queues a compile; callers `refresh` afterwards (once per batch).
     let queue = {
         let (state, app) = (state.clone(), app.as_weak());
         Rc::new(move |id: &str| {
@@ -185,38 +287,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    // Repository imports clone over the network, so they run off the UI thread too.
-    let (import_tx, import_rx) = mpsc::channel::<Result<github::Imported, String>>();
+    // Imports clone and download, so they run off the UI thread and stream results back.
+    let (import_tx, import_rx) = mpsc::channel::<ImportMsg>();
 
     let poll = Timer::default();
     poll.start(TimerMode::Repeated, Duration::from_millis(30), {
         let (state, app, hl, save) = (state.clone(), app.as_weak(), hl.clone(), schedule_save.clone());
-        let (add_pairs, queue) = (add_pairs.clone(), queue.clone());
+        let (add_pairs, queue, refresh) = (add_pairs.clone(), queue.clone(), refresh.clone());
         move || {
             let Some(app) = app.upgrade() else { return };
-            while let Ok(result) = import_rx.try_recv() {
-                app.set_importing(false);
-                match result {
-                    Ok(imported) => {
-                        let found = imported.pairs.len();
-                        let (new_ids, dupes) = add_pairs(imported.pairs);
+            let mut touched = false;
+
+            while let Ok(msg) = import_rx.try_recv() {
+                match msg {
+                    ImportMsg::Status(text) => app.set_status(text.into()),
+                    ImportMsg::Pairs { label, pairs, files } => {
+                        let found = pairs.len();
+                        let (new_ids, dupes) = add_pairs(pairs);
                         for id in &new_ids {
                             queue(id);
                         }
                         if !new_ids.is_empty() {
                             save();
+                            touched = true;
                         }
                         app.set_status(
-                            format!(
-                                "imported {} new pairs from {} ({found} found in {} files, {dupes} already present) — compiling…",
-                                new_ids.len(), imported.label, imported.files
-                            )
-                            .into(),
+                            format!("{label}: {} new pairs ({found} found in {files} files, {dupes} already present)", new_ids.len())
+                                .into(),
                         );
                     }
-                    Err(e) => app.set_status(format!("import failed: {e}").into()),
+                    ImportMsg::Finished(text) => {
+                        app.set_importing(false);
+                        app.set_status(text.into());
+                    }
                 }
             }
+
             while let Ok(done) = done_rx.try_recv() {
                 let changed = {
                     let mut s = state.borrow_mut();
@@ -237,19 +343,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                    if changed {
+                        s.recheck(&done.id);
+                    }
                     sync_pending(&app, &s);
                     changed
                 };
+                touched = true;
                 if changed {
                     save();
                 }
+            }
+
+            if touched {
+                refresh();
             }
         }
     });
 
     // Queue the compile for whichever pair is selected.
     let queue_selected = {
-        let (state, queue) = (state.clone(), queue.clone());
+        let (state, queue, refresh) = (state.clone(), queue.clone(), refresh.clone());
         Rc::new(move || {
             let id = {
                 let s = state.borrow();
@@ -257,6 +371,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             if let Some(id) = id {
                 queue(&id);
+                refresh();
             }
         })
     };
@@ -273,6 +388,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for id in &unfinished {
         queue(id);
     }
+    refresh();
 
     app.on_factory_changed({
         let (state, app) = (state.clone(), app.as_weak());
@@ -286,7 +402,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     app.on_generate({
-        let (state, app, save, queue, add_pairs) = (state.clone(), app.as_weak(), schedule_save.clone(), queue.clone(), add_pairs.clone());
+        let (state, app, save) = (state.clone(), app.as_weak(), schedule_save.clone());
+        let (queue, add_pairs, refresh) = (queue.clone(), add_pairs.clone(), refresh.clone());
         move |seed, count| {
             let Some(app) = app.upgrade() else { return };
             let (Ok(seed), Ok(count)) = (seed.trim().parse::<u64>(), count.trim().parse::<u64>()) else {
@@ -299,10 +416,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let (new_ids, skipped) = add_pairs(pairs);
             let added = new_ids.len();
-            // The pairs are already listed; compiling happens in the background.
+            // The pairs are listed right away; compiling happens in the background.
             for id in &new_ids {
                 queue(id);
             }
+            refresh();
             app.set_seed_text(seed.saturating_add(count).to_string().into());
             if added > 0 {
                 save();
@@ -314,7 +432,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.on_import_repo({
         let (state, app) = (state.clone(), app.as_weak());
-        let github_settings = settings.github.clone();
+        let (github_settings, collection_settings) = (settings.github.clone(), settings.collection.clone());
+        let tx = import_tx.clone();
         move |spec| {
             let Some(app) = app.upgrade() else { return };
             if app.get_importing() || spec.trim().is_empty() {
@@ -325,37 +444,92 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 s.factories[s.factory].clone()
             };
             app.set_importing(true);
-            app.set_status(format!("cloning {}…", spec.trim()).into());
-            let (spec, settings, tx) = (spec.to_string(), github_settings.clone(), import_tx.clone());
+            let (gh, cs, tx, source) =
+                (github_settings.clone(), collection_settings.clone(), tx.clone(), parse_source(&spec));
+            app.set_status(
+                match &source {
+                    Source::Repo(r) => format!("cloning {r}…"),
+                    Source::Gem(g) => format!("importing gem {g}…"),
+                    Source::AllGems => "importing every gem in the collection…".to_string(),
+                }
+                .into(),
+            );
             thread::spawn(move || {
-                let _ = tx.send(github::import(factory.as_ref(), &spec, &settings));
+                let finished = match source {
+                    Source::Repo(spec) => match github::import(factory.as_ref(), &spec, &gh) {
+                        Ok(i) => {
+                            let _ = tx.send(ImportMsg::Pairs { label: i.label.clone(), pairs: i.pairs, files: i.files });
+                            format!("imported {}", i.label)
+                        }
+                        Err(e) => format!("import failed: {e}"),
+                    },
+                    Source::Gem(_) | Source::AllGems => import_from_collection(&factory, &source, &cs, &gh, &tx),
+                };
+                let _ = tx.send(ImportMsg::Finished(finished));
             });
         }
     });
 
+    app.on_sync_collection({
+        let app = app.as_weak();
+        let (github_settings, collection_settings) = (settings.github.clone(), settings.collection.clone());
+        let tx = import_tx.clone();
+        move || {
+            let Some(app) = app.upgrade() else { return };
+            if app.get_importing() {
+                return;
+            }
+            app.set_importing(true);
+            app.set_status("syncing gem_rbs_collection…".into());
+            let (gh, cs, tx) = (github_settings.clone(), collection_settings.clone(), tx.clone());
+            thread::spawn(move || {
+                let msg = match collection::sync(&cs, &gh) {
+                    Ok(s) => format!("synced gem_rbs_collection @ {}: {} gems ({})", s.commit, s.gems, s.root.display()),
+                    Err(e) => format!("sync failed: {e}"),
+                };
+                let _ = tx.send(ImportMsg::Finished(msg));
+            });
+        }
+    });
+
+    app.on_filter_changed({
+        let (state, app, refresh) = (state.clone(), app.as_weak(), refresh.clone());
+        move || {
+            if let Some(app) = app.upgrade() {
+                state.borrow_mut().only_mismatches = app.get_only_mismatches();
+                refresh();
+            }
+        }
+    });
+
     app.on_select({
-        let (state, show, queue_selected) = (state.clone(), show.clone(), queue_selected.clone());
-        move |i| {
-            state.borrow_mut().selected = Some(i as usize);
+        let (state, show, refresh, queue_selected) = (state.clone(), show.clone(), refresh.clone(), queue_selected.clone());
+        move |row| {
+            {
+                let mut s = state.borrow_mut();
+                s.selected = s.visible.get(row as usize).copied();
+            }
+            refresh();
             show(); // render the pair first…
             queue_selected(); // …then kick off the compile
         }
     });
 
     app.on_delete_selected({
-        let (state, rows, show, save) = (state.clone(), rows.clone(), show.clone(), schedule_save.clone());
+        let (state, show, refresh, save) = (state.clone(), show.clone(), refresh.clone(), schedule_save.clone());
         move || {
             let removed = {
                 let mut s = state.borrow_mut();
                 match s.selected.take() {
                     Some(i) if i < s.store.pairs.len() => {
-                        s.store.pairs.remove(i);
-                        rows.remove(i);
+                        let pair = s.store.pairs.remove(i);
+                        s.verdicts.remove(&pair.id);
                         true
                     }
                     _ => false,
                 }
             };
+            refresh();
             show();
             if removed {
                 save();
@@ -363,21 +537,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Edits: write through to the store and the list row, then debounce a save.
+    // Edits: write through to the store, then debounce a save.
     macro_rules! on_edit {
         ($setter:ident, $field:ident) => { on_edit!($setter, $field, |_: &Rc<RefCell<State>>| {}) };
         ($setter:ident, $field:ident, $after:expr) => {{
-            let (state, rows, save) = (state.clone(), rows.clone(), schedule_save.clone());
+            let (state, refresh, save) = (state.clone(), refresh.clone(), schedule_save.clone());
             app.$setter(move |text| {
                 {
                     let mut s = state.borrow_mut();
                     let Some(i) = s.selected else { return };
                     s.store.pairs[i].$field = text.to_string();
-                    if let Some(mut row) = rows.row_data(i) {
-                        row.summary = summary(&s.store.pairs[i]).into();
-                        rows.set_row_data(i, row);
-                    }
                 }
+                refresh(); // the row's summary may have changed
                 save();
                 ($after)(&state);
             });
@@ -410,4 +581,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.run()?;
     Ok(())
+}
+
+/// Syncs the collection, then imports one gem or all of them, streaming each
+/// gem's pairs to the UI as it finishes. Returns the closing status line.
+fn import_from_collection(
+    factory: &Arc<dyn PairFactory>,
+    source: &Source,
+    cs: &synthentic_sample::settings::CollectionSettings,
+    gh: &synthentic_sample::settings::GithubSettings,
+    tx: &mpsc::Sender<ImportMsg>,
+) -> String {
+    let _ = tx.send(ImportMsg::Status("syncing gem_rbs_collection…".into()));
+    let root = match collection::ensure(cs, gh) {
+        Ok(r) => r,
+        Err(e) => return format!("sync failed: {e}"),
+    };
+    let gems = match source {
+        Source::Gem(spec) => match collection::find(&root, spec) {
+            Ok(g) => vec![g],
+            Err(e) => return format!("import failed: {e}"),
+        },
+        _ => collection::latest(&collection::list_gems(&root)),
+    };
+
+    let (finished, failed, total_pairs) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let first_error = std::sync::Mutex::new(None::<String>);
+    collection::import_gems(factory.as_ref(), &gems, cs, gh, &|g, result| {
+        let n = finished.fetch_add(1, Ordering::SeqCst) + 1;
+        match result {
+            Ok(i) => {
+                total_pairs.fetch_add(i.pairs.len(), Ordering::SeqCst);
+                let _ = tx.send(ImportMsg::Pairs { label: format!("[{n}/{}] {}", gems.len(), i.label), pairs: i.pairs, files: i.files });
+            }
+            Err(e) => {
+                failed.fetch_add(1, Ordering::SeqCst);
+                let msg = format!("{}/{}: {e}", g.name, g.version);
+                let _ = tx.send(ImportMsg::Status(format!("[{n}/{}] {msg}", gems.len())));
+                first_error.lock().unwrap().get_or_insert(msg);
+            }
+        }
+    });
+    let failed = failed.into_inner();
+    let mut text = format!("imported {} pairs from {} gems", total_pairs.into_inner(), gems.len() - failed);
+    if let Some(e) = first_error.into_inner().unwrap() {
+        text.push_str(&format!("; {failed} failed (first: {e})"));
+    }
+    text
 }

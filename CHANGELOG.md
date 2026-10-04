@@ -15,10 +15,15 @@
 - **Settings file** (`settings.json`, see `settings.example.json`): sentinel and LSP commands/args and the LSP toggle, highlight toggle and every theme colour, and the `github` options. Every field is optional. `SENTINEL_BIN` overrides the sentinel and LSP commands.
 - `examples/snapshot.rs` renders the window to raw RGBA for visual checks.
 
+- **Import from `ruby/gem_rbs_collection`** (`gems`, `gem:NAME`, `gem:NAME/VERSION`): the app syncs the collection into a cache directory (shallow clone, then fast-forward; falls back to the cached copy offline), downloads each gem's source with `gem unpack '~> X.Y.0'` (cached, `collection.jobs` at a time), and reverse-compiles the collection's `.rbs` into the gem's Ruby. Results stream into the list as each gem finishes. **Sync collection** button; `cargo run --example import -- gems out.jsonl` runs it headless.
+- **Match check for imported pairs**: every imported pair stores `expected` (the source signatures behind its annotations). After sentinel compiles the output, the compiled RBS is compared with `expected` member by member (whitespace and sentinel's trailing comma in wrapped parameter lists are ignored). The list shows a green/red/gray dot per pair, the compiled panel shows `✓ matches` or `✗ MISMATCH` with one line per difference, and **mismatches only** filters the list.
+- `collection` settings: `url`, `cache_dir`, `gem`, `auto_sync`, `jobs`, `exclude_dirs`.
+
 ### Licensing
 - Dual licensed under MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`, `license` in `Cargo.toml`).
 
 ### Known limitations
+- Sentinel transpiles one class per file (the first `class`, wrapped in its enclosing modules), so files with several classes, or a module plus a class, are flagged as mismatches. On the full `gem_rbs_collection` (3,440 pairs) 74% match and every one of the other 26% is a member sentinel didn't emit, never a differing signature.
 - Needs a sentinel that transpiles trailing `attr_*` types, `# @rbs` tags and ivars. Older builds silently drop them.
 - sentinel does not attach `#:` to `private def foo` / `protected def foo`; imports annotate those methods anyway (valid inline RBS) and the warnings land in the pair's `diagnostics`.
 - Import skips Ruby files with no matching `.rbs`, overloaded methods and multi-symbol `attr_*` lines. Repos with inline annotations but no `.rbs` yield nothing.

@@ -66,6 +66,7 @@ mod tests {
             instruction: "i\nmultiline".into(),
             input: "a".into(),
             output: "b".into(),
+            expected: String::new(),
             compiled: String::new(),
             compile_error: None,
             diagnostics: Vec::new(),

@@ -1,32 +1,46 @@
-//! Renders the GUI with one sample pair to a PNG (dev aid): `cargo run --example snapshot -- out.png [seed]`.
+//! Renders the GUI to raw RGBA (dev aid) with the pairs from a JSONL file:
+//! `cargo run --example snapshot -- out pairs.jsonl [id-substring]`.
+//! Selects the first pair whose id contains the substring (default: the first mismatch).
 
-use slint::ComponentHandle;
-use synthentic_sample::{Settings, highlight::Highlighter, registry, ui::*};
+use slint::{ComponentHandle, ModelRc, VecModel};
+use synthentic_sample::{Settings, Store, highlight::Highlighter, pair::Check, ui::*};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let out = args.next().unwrap_or_else(|| "snapshot.png".into());
-    let seed: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(7);
+    let out = args.next().unwrap_or_else(|| "snapshot".into());
+    let store = Store::open(args.next().ok_or("usage: snapshot out pairs.jsonl [id]")?)?;
+    let wanted = args.next();
 
     let settings = Settings::load("settings.json".as_ref())?;
     let hl = Highlighter::new(&settings.highlight.theme);
-    let factories = registry(&settings);
-    // First seed at/after `seed` that uses `#:` comments, with one signature broken
-    // so the diagnostics strip has something to show.
-    let mut pair = (seed..).map(|s| factories[0].generate(s)).find(|p| p.output.contains("\n  #: (")).unwrap();
-    pair.output = pair.output.replacen(") -> ", ") -> oops(", 1);
-    pair.recompile(factories[0].as_ref());
-
     let app = App::new()?;
     app.set_highlight_enabled(settings.highlight.enabled);
+
+    let checks: Vec<Check> = store.pairs.iter().map(|p| p.check()).collect();
+    let rows: Vec<Row> = store.pairs.iter().zip(&checks).map(|(p, c)| row_for(p, verdict_code(c))).collect();
+    let mismatched = checks.iter().filter(|c| matches!(c, Check::Mismatch(_))).count();
+    let matched = checks.iter().filter(|c| **c == Check::Match).count();
+    app.set_counts_text(format!("{0} shown of {0} pairs — {matched} match, {mismatched} mismatch", rows.len()).into());
+    app.set_rows(ModelRc::new(VecModel::from(rows)));
+
+    let pick = store
+        .pairs
+        .iter()
+        .position(|p| match &wanted {
+            Some(w) => p.id.contains(w.as_str()),
+            None => matches!(p.check(), Check::Mismatch(_)),
+        })
+        .unwrap_or(0);
+    let pair = &store.pairs[pick];
+    app.set_selected(pick as i32);
+    app.set_has_selection(true);
     app.set_instruction(pair.instruction.clone().into());
     app.set_input_text(pair.input.clone().into());
     app.set_output_text(pair.output.clone().into());
-    app.set_selected(0);
-    show_compiled(&app, &pair, &hl);
+    show_compiled(&app, pair, &hl);
+
     app.window().set_size(slint::LogicalSize::new(1400.0, 800.0));
     app.show()?;
-    // Let layout settle, then capture.
     slint::Timer::single_shot(std::time::Duration::from_millis(300), move || {
         let buf = app.window().take_snapshot().expect("snapshot");
         std::fs::write(format!("{out}.rgba"), buf.as_bytes()).unwrap();

@@ -71,9 +71,44 @@ impl Default for GithubSettings {
     }
 }
 
+/// The `ruby/gem_rbs_collection` signature repository, used as an import source.
+/// The collection holds only `.rbs`; the Ruby comes from the gems themselves.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CollectionSettings {
+    /// Repository to sync.
+    pub url: String,
+    /// Where the clone and unpacked gems are cached. Empty means `~/.cache/synthentic-sample`.
+    pub cache_dir: String,
+    /// The `gem` executable used to download and unpack gem sources.
+    pub gem: String,
+    /// Fetch the latest signatures before every collection import.
+    pub auto_sync: bool,
+    /// How many gems are downloaded and turned into pairs at once.
+    pub jobs: usize,
+    /// Directory names skipped inside an unpacked gem.
+    pub exclude_dirs: Vec<String>,
+}
+
+impl Default for CollectionSettings {
+    fn default() -> Self {
+        Self {
+            url: "https://github.com/ruby/gem_rbs_collection.git".into(),
+            cache_dir: String::new(),
+            gem: "gem".into(),
+            auto_sync: true,
+            jobs: 4,
+            exclude_dirs: ["test", "spec", "vendor", "node_modules", ".git", "tmp", "bin", "examples", "features"]
+                .map(String::from)
+                .to_vec(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Settings {
+    pub collection: CollectionSettings,
     pub github: GithubSettings,
     /// The transpiler run on each pair's output (`sentinel init`).
     pub sentinel: SentinelSettings,
