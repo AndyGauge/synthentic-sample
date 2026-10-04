@@ -96,6 +96,13 @@ fn parse_source(spec: &str) -> Source {
     }
 }
 
+/// Fills the gem picker from the cached collection (empty until it has been synced).
+fn load_gem_names(app: &App, cs: &synthentic_sample::settings::CollectionSettings) {
+    let gems = collection::latest(&collection::list_gems(&collection::checkout(cs)));
+    let names: Vec<SharedString> = gems.iter().map(|g| SharedString::from(g.name.as_str())).collect();
+    app.set_gem_names(ModelRc::new(VecModel::from(names)));
+}
+
 /// Mirrors the in-flight compile count into the UI.
 fn sync_pending(app: &App, s: &State) {
     app.set_pending_compiles(s.pending.values().sum::<usize>() as i32);
@@ -128,6 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )));
     app.set_factory_description(factories[0].description().into());
     app.set_seed_text(next_seed.to_string().into());
+    load_gem_names(&app, &settings.collection);
     app.set_status(format!("{} — {} pairs loaded", path.display(), store.pairs.len()).into());
 
     let verdicts = store.pairs.iter().map(|p| (p.id.clone(), p.check())).collect();
@@ -294,6 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     poll.start(TimerMode::Repeated, Duration::from_millis(30), {
         let (state, app, hl, save) = (state.clone(), app.as_weak(), hl.clone(), schedule_save.clone());
         let (add_pairs, queue, refresh) = (add_pairs.clone(), queue.clone(), refresh.clone());
+        let collection_settings = settings.collection.clone();
         move || {
             let Some(app) = app.upgrade() else { return };
             let mut touched = false;
@@ -319,6 +328,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ImportMsg::Finished(text) => {
                         app.set_importing(false);
                         app.set_status(text.into());
+                        load_gem_names(&app, &collection_settings); // a sync may have added gems
                     }
                 }
             }
@@ -346,6 +356,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if changed {
                         s.recheck(&done.id);
                     }
+                    app.set_compile_mode(s.factories[s.factory].compile_mode().into());
                     sync_pending(&app, &s);
                     changed
                 };

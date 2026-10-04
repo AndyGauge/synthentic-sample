@@ -118,12 +118,19 @@ pub fn annotate(src: &str, index: &RbsIndex) -> Annotated {
                     .map(|l| indent_of(l))
                     .filter(|&n| n > ind)
                     .unwrap_or(ind + 2);
+                let before = count;
                 for (ivar, ty) in &sigs.ivars {
-                    if !sigs.attrs.contains_key(ivar.trim_start_matches('@')) {
+                    // Class variables (`@@x`) are skipped: rbs-inline doesn't read that form.
+                    if !ivar.starts_with("@@") && !sigs.attrs.contains_key(ivar.trim_start_matches('@')) {
                         out.push(format!("{}# @rbs {ivar}: {ty}", " ".repeat(member_indent)));
                         expected.add(&qualified, format!("{ivar}: {ty}"));
                         count += 1;
                     }
+                }
+                // rbs-inline reads a comment directly above a member as that member's
+                // documentation and ignores an `@rbs @ivar` in it, so set the block apart.
+                if count > before && lines.get(i + 1).is_some_and(|l| !l.trim().is_empty()) {
+                    out.push(String::new());
                 }
             }
             stack.push(Scope { indent: ind, name: Some(qualified) });
@@ -260,7 +267,7 @@ end
             "    attr_reader :items #: Array[String]",
             "    attr_accessor :owner #: String?",
             "    attr_reader :a, :b\n", // multi-symbol: left alone
-            "    # @rbs @count: Integer\n",
+            "    # @rbs @count: Integer\n\n",
             "    #: (?Integer) -> void\n    def initialize(count = 0)",
             "    # Adds an item.\n    #: (String item, ?qty: Integer) -> void\n    def add(item, qty: 1)",
             "    #: () -> Cart\n    def self.build",
@@ -299,6 +306,15 @@ end
         assert_eq!(a.expected.lines().count(), 1 + a.count + 1);
         // And it is a faithful subset of the original RBS.
         assert_eq!(mismatches(&a.expected, RBS), Vec::<String>::new());
+    }
+
+    #[test]
+    fn class_variables_are_not_annotated() {
+        let mut i = RbsIndex::default();
+        i.add_file("class A\n  @@shared: Integer\n  @own: String\n  def f: () -> void\nend\n");
+        let a = annotate("class A\n  def f; end\nend\n", &i);
+        assert!(a.text.contains("# @rbs @own: String\n\n  #: () -> void") && !a.text.contains("@@shared"), "{}", a.text);
+        assert!(!a.expected.contains("@@"), "{}", a.expected);
     }
 
     #[test]

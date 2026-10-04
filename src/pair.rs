@@ -134,6 +134,12 @@ pub trait PairFactory: Send + Sync {
         Vec::new()
     }
 
+    /// A short note on how `compile` is currently being done, for the UI (e.g. which
+    /// of several strategies is in use). Empty when there is nothing to say.
+    fn compile_mode(&self) -> String {
+        String::new()
+    }
+
     /// Runs the downstream compiler/transpiler over a pair's `output`, returning
     /// what it produces and any diagnostics about the source. Side-effecting
     /// (spawns processes), so it is separate from the pure `generate`.

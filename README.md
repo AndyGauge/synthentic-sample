@@ -32,7 +32,8 @@ gpt-oss-120b) that needs to learn a code style it doesn't already know.
   [Settings](#settings)). It needs to transpile trailing `attr_*` types, `# @rbs` tags and ivars (see
   [rbs-sentinel#33](https://github.com/AndyGauge/rbs-sentinel/issues/33)); older builds silently drop those.
   If it also supports the `sentinel/transpile` request over `sentinel lsp`, compiling happens in memory in
-  about a millisecond per pair; otherwise the app falls back to running `sentinel init` per pair.
+  about a millisecond per pair; otherwise the app falls back to running `sentinel init` in a temp directory per pair. The compiled panel says
+  which of the two is in use ("compiled in memory via sentinel lsp" or "compiled fallback: sentinel init…").
 - `git`, for syncing the collection and importing from GitHub.
 - `gem` (RubyGems), for downloading gem sources when importing from the collection.
 
@@ -104,15 +105,19 @@ Attributes get a trailing `#: Type` in both styles.
 
 ## Importing
 
-Type one of these into the box above the list and click **Import**:
+The left-hand panel has two import sections:
 
-| Spec | Imports |
-|---|---|
-| `gems` | the newest version of every gem in `ruby/gem_rbs_collection` |
-| `gem:redis` / `gem:rails/7.0` | one gem (newest version, or a specific version directory) |
-| `owner/repo[@ref]`, or a `https://github.com/…` / `git@github.com:…` URL | a GitHub repository |
+- **gem_rbs_collection** (the main source):
+  - **Sync** downloads (or updates) the collection and fills the gem picker. A first-time user sees
+    "Press Sync to list the collection's gems"; importing syncs on its own too.
+  - Pick a gem and press **Import gem** for one gem, or press **Import all gems** for the newest version of
+    every gem in the collection (about 170 gems, and several minutes of downloading).
+- **GitHub repository**: `owner/repo`, optionally `owner/repo@branch-or-tag`, or a `https://github.com/…` /
+  `git@github.com:…` URL, then **Import**.
 
-Imports run in the background and stream their pairs into the list as each gem finishes.
+Imports run in the background and stream their pairs into the list as each gem finishes. The headless
+equivalents are `cargo run --release --example import -- gems out.jsonl`, `… -- gem:redis out.jsonl` and
+`… -- owner/repo out.jsonl`.
 
 ### The gem_rbs_collection
 
@@ -121,13 +126,11 @@ gem the app:
 
 1. **Syncs** the collection into a cache directory (`~/.cache/synthentic-sample` by default): a shallow clone
    the first time, a fast-forward afterwards. This happens automatically before an import
-   (`collection.auto_sync`), and the **Sync collection** button does it on its own. If the network is down it
+   (`collection.auto_sync`), and the **Sync** button does it on its own. If the network is down it
    falls back to the cached copy.
 2. **Downloads the gem's source** with `gem unpack NAME --version '~> X.Y.0'` for the collection's `X.Y`
    directory, and caches it. Several gems are fetched at once (`collection.jobs`, default 4).
 3. **Reverse compiles** the gem's Ruby against the collection's `.rbs` (below).
-
-The headless equivalent is `cargo run --release --example import -- gems out.jsonl` (or `gem:NAME`).
 
 ### Reverse compiling
 
@@ -156,7 +159,7 @@ sentinel adds when it wraps long parameter lists don't count; extra members in s
   still compiling. Synthetic pairs have no dot: they have no ground truth.
 - Select a pair to see **✓ matches the source RBS** or **✗ MISMATCH** above the compiled panel, with one line
   per difference (`missing from compiled RBS (expected …)` or `expected …, compiled …`).
-- **mismatches only** filters the list to the red ones, and the line under the list tallies matches and
+- **show mismatches only** filters the list to the red ones, and the line under the list tallies matches and
   mismatches.
 
 On the full collection (174 gems, 172 of which could be fetched, 3,440 pairs) 74% of pairs match exactly. The

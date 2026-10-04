@@ -1,8 +1,13 @@
-//! Runs the `sentinel` transpiler (rbs-sentinel gem) over a Ruby source string.
+//! The **fallback** way to run `sentinel` over a Ruby source string.
 //!
-//! Sentinel is directory based: `sentinel init` transpiles `./app/**/*.rb` into
-//! `./sig/generated/**/*.rbs` relative to the working directory, so each call gets
-//! a throwaway project directory. The command comes from the settings file.
+//! The preferred path is in memory: `sentinel lsp` plus its `sentinel/transpile`
+//! request (see `crate::lsp` and `RubyRbsFactory::compile`), which needs no files.
+//! This module is used only when that isn't available: the sentinel in use predates
+//! that request, or the LSP is disabled or can't be started.
+//!
+//! The `sentinel init` command is directory based: it transpiles `./app/**/*.rb`
+//! into `./sig/generated/**/*.rbs` relative to the working directory, so each call
+//! gets a throwaway project directory. The command comes from the settings file.
 
 use crate::settings::Tool;
 use std::{fs, process::Command};

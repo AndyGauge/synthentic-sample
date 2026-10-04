@@ -46,7 +46,8 @@ pub fn cache_dir(s: &CollectionSettings) -> PathBuf {
     }
 }
 
-fn checkout(s: &CollectionSettings) -> PathBuf {
+/// Where the collection is cloned inside the cache.
+pub fn checkout(s: &CollectionSettings) -> PathBuf {
     cache_dir(s).join("gem_rbs_collection")
 }
 

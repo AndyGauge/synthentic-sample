@@ -3,7 +3,8 @@
 //! Selects the first pair whose id contains the substring (default: the first mismatch).
 
 use slint::{ComponentHandle, ModelRc, VecModel};
-use synthentic_sample::{Settings, Store, highlight::Highlighter, pair::Check, ui::*};
+use slint::SharedString;
+use synthentic_sample::{Settings, Store, collection, highlight::Highlighter, pair::Check, ui::*};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -15,6 +16,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hl = Highlighter::new(&settings.highlight.theme);
     let app = App::new()?;
     app.set_highlight_enabled(settings.highlight.enabled);
+    let gems = collection::latest(&collection::list_gems(&collection::checkout(&settings.collection)));
+    app.set_gem_names(ModelRc::new(VecModel::from(gems.iter().map(|g| SharedString::from(g.name.as_str())).collect::<Vec<_>>())));
 
     let checks: Vec<Check> = store.pairs.iter().map(|p| p.check()).collect();
     let rows: Vec<Row> = store.pairs.iter().zip(&checks).map(|(p, c)| row_for(p, verdict_code(c))).collect();

@@ -35,7 +35,14 @@ struct Lsp {
     client: Option<LspClient>,
     /// Set once the server has told us it lacks `sentinel/transpile`.
     legacy: bool,
+    /// How the last compile was done, for `compile_mode`.
+    mode: &'static str,
 }
+
+const MODE_MEMORY: &str = "in memory via sentinel lsp (sentinel/transpile)";
+const MODE_OLD_SENTINEL: &str = "fallback: sentinel init in a temp dir (this sentinel lacks sentinel/transpile)";
+const MODE_NO_LSP: &str = "fallback: sentinel init in a temp dir (sentinel lsp unavailable)";
+const MODE_LSP_OFF: &str = "sentinel init in a temp dir (lsp disabled in settings)";
 
 impl RubyRbsFactory {
     pub fn new(sentinel: SentinelSettings, lsp: LspSettings) -> Self {
@@ -97,6 +104,10 @@ impl PairFactory for RubyRbsFactory {
         }
     }
 
+    fn compile_mode(&self) -> String {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).mode.to_string()
+    }
+
     fn import_extensions(&self) -> &'static [&'static str] {
         &[".rb", ".rbs"]
     }
@@ -139,15 +150,24 @@ impl PairFactory for RubyRbsFactory {
     }
 
     fn compile(&self, source: &str) -> Result<Compiled, String> {
+        let set_mode = |mode: &'static str| self.state.lock().unwrap_or_else(|e| e.into_inner()).mode = mode;
         let legacy = self.state.lock().unwrap_or_else(|e| e.into_inner()).legacy;
-        if self.lsp.enabled && !legacy {
+        if !self.lsp.enabled {
+            set_mode(MODE_LSP_OFF);
+        } else if legacy {
+            set_mode(MODE_OLD_SENTINEL);
+        } else {
             match self.with_client(|c| c.transpile(source)) {
-                Ok(c) => return Ok(c),
+                Ok(c) => {
+                    set_mode(MODE_MEMORY);
+                    return Ok(c);
+                }
                 Err(e) if e.contains("-32601") => {
                     self.state.lock().unwrap_or_else(|e| e.into_inner()).legacy = true;
+                    set_mode(MODE_OLD_SENTINEL);
                 }
                 // Couldn't start or talk to the server: `sentinel init` still works.
-                Err(_) => {}
+                Err(_) => set_mode(MODE_NO_LSP),
             }
         }
         self.compile_legacy(source)

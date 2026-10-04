@@ -15,9 +15,15 @@
 - **Settings file** (`settings.json`, see `settings.example.json`): sentinel and LSP commands/args and the LSP toggle, highlight toggle and every theme colour, and the `github` options. Every field is optional. `SENTINEL_BIN` overrides the sentinel and LSP commands.
 - `examples/snapshot.rs` renders the window to raw RGBA for visual checks.
 
-- **Import from `ruby/gem_rbs_collection`** (`gems`, `gem:NAME`, `gem:NAME/VERSION`): the app syncs the collection into a cache directory (shallow clone, then fast-forward; falls back to the cached copy offline), downloads each gem's source with `gem unpack '~> X.Y.0'` (cached, `collection.jobs` at a time), and reverse-compiles the collection's `.rbs` into the gem's Ruby. Results stream into the list as each gem finishes. **Sync collection** button; `cargo run --example import -- gems out.jsonl` runs it headless.
-- **Match check for imported pairs**: every imported pair stores `expected` (the source signatures behind its annotations). After sentinel compiles the output, the compiled RBS is compared with `expected` member by member (whitespace and sentinel's trailing comma in wrapped parameter lists are ignored). The list shows a green/red/gray dot per pair, the compiled panel shows `✓ matches` or `✗ MISMATCH` with one line per difference, and **mismatches only** filters the list.
+- **Import from `ruby/gem_rbs_collection`** (`gems`, `gem:NAME`, `gem:NAME/VERSION`): the app syncs the collection into a cache directory (shallow clone, then fast-forward; falls back to the cached copy offline), downloads each gem's source with `gem unpack '~> X.Y.0'` (cached, `collection.jobs` at a time), and reverse-compiles the collection's `.rbs` into the gem's Ruby. Results stream into the list as each gem finishes. **Sync** button, a gem picker with **Import gem**, and **Import all gems** (the gem names are also accepted in the GitHub box as `gem:NAME` / `gems`); `cargo run --example import -- gems out.jsonl` runs it headless.
+- **Match check for imported pairs**: every imported pair stores `expected` (the source signatures behind its annotations). After sentinel compiles the output, the compiled RBS is compared with `expected` member by member (whitespace and sentinel's trailing comma in wrapped parameter lists are ignored). The list shows a green/red/gray dot per pair, the compiled panel shows `✓ matches` or `✗ MISMATCH` with one line per difference, and **show mismatches only** filters the list.
 - `collection` settings: `url`, `cache_dir`, `gem`, `auto_sync`, `jobs`, `exclude_dirs`.
+
+- **Which compile path is in use**: the compiled panel notes whether pairs are compiled "in memory via sentinel lsp (sentinel/transpile)" or by one of the `sentinel init` fallbacks (this sentinel lacks `sentinel/transpile`, the LSP is unavailable, or it is disabled in settings).
+
+### Changed
+- Reverse-compiled annotations are now valid for the reference implementation too (found by checking pairs against `rbs-inline`): the `# @rbs @ivar: T` block is followed by a blank line, since rbs-inline reads a comment directly above a member as that member's documentation and drops it; class variables (`@@x`) are no longer annotated, since rbs-inline doesn't read that form.
+- `gem unpack` failures now report `gem`'s own message (for example "Gem 'sidekiq-pro' not installed nor fetchable") instead of "unexpected output".
 
 ### Licensing
 - Dual licensed under MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`, `license` in `Cargo.toml`).

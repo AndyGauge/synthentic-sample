@@ -39,8 +39,10 @@ export component App inherits Window {
     in property <bool> compiling;
     in property <int> pending-compiles;
     in property <bool> has-selection;
+    in property <[string]> gem-names;
     in property <string> counts-text;
     in property <string> verdict-text;
+    in property <string> compile-mode;
     in property <color> verdict-color: #888;
     in property <[Diag]> mismatch-lines;
     in-out property <bool> only-mismatches;
@@ -97,32 +99,60 @@ export component App inherits Window {
                 clicked => { root.generate(root.seed-text, root.count-text); }
             }
 
+            Text { text: "gem_rbs_collection"; font-weight: 700; }
+            HorizontalLayout {
+                spacing: 6px;
+                gem-box := ComboBox {
+                    model: root.gem-names;
+                    horizontal-stretch: 1;
+                }
+                Button {
+                    text: "Import gem";
+                    enabled: !root.importing && root.gem-names.length > 0;
+                    clicked => { root.import-repo("gem:" + gem-box.current-value); }
+                }
+            }
+            HorizontalLayout {
+                spacing: 6px;
+                Button {
+                    text: root.importing ? "Working…" : "Import all gems";
+                    enabled: !root.importing;
+                    horizontal-stretch: 1;
+                    clicked => { root.import-repo("gems"); }
+                }
+                Button {
+                    text: "Sync";
+                    enabled: !root.importing;
+                    clicked => { root.sync-collection(); }
+                }
+            }
+            Text {
+                text: root.gem-names.length == 0
+                    ? "Press Sync to list the collection's gems. Importing also syncs."
+                    : root.gem-names.length + " gems (newest version of each)";
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+
+            Text { text: "GitHub repository"; font-weight: 700; }
             HorizontalLayout {
                 spacing: 6px;
                 LineEdit {
-                    placeholder-text: "owner/repo, gem:name, or gems";
+                    placeholder-text: "owner/repo[@ref]";
                     text <=> root.repo-text;
                     accepted => { root.import-repo(root.repo-text); }
                 }
                 Button {
-                    text: root.importing ? "Importing…" : "Import";
+                    text: "Import";
                     enabled: !root.importing;
                     clicked => { root.import-repo(root.repo-text); }
                 }
             }
 
-            HorizontalLayout {
-                spacing: 6px;
-                Button {
-                    text: "Sync collection";
-                    enabled: !root.importing;
-                    clicked => { root.sync-collection(); }
-                }
-                CheckBox {
-                    text: "mismatches only";
-                    checked <=> root.only-mismatches;
-                    toggled => { root.filter-changed(); }
-                }
+            CheckBox {
+                text: "show mismatches only";
+                checked <=> root.only-mismatches;
+                toggled => { root.filter-changed(); }
             }
 
             ListView {
@@ -210,6 +240,12 @@ export component App inherits Window {
                         text: root.compile-failed ? "Compiled — ERROR" : (root.compiling ? "Compiled — compiling…" : "Compiled (sentinel → RBS)");
                         font-weight: 700;
                         color: root.compile-failed ? #d33 : black;
+                    }
+                    if root.compile-mode != "": Text {
+                        text: "compiled " + root.compile-mode;
+                        color: #888;
+                        font-size: 10px;
+                        wrap: word-wrap;
                     }
                     if root.verdict-text != "": Text {
                         text: root.verdict-text;
