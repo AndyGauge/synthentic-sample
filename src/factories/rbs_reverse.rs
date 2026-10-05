@@ -18,6 +18,33 @@ struct Scope {
     indent: usize,
     /// Fully-qualified name; `None` for a `class << self` body.
     name: Option<String>,
+    /// A `Class.new do` / `Module.new do` body: its members belong to a class with no name,
+    /// not to the class around it, so the RBS for the enclosing class says nothing about them.
+    anonymous: bool,
+}
+
+/// `included do`, `prepended do`, `extended do` (ActiveSupport::Concern hooks): the body runs in
+/// the class that includes the module, so its members are not the module's own. Sentinel skips
+/// them on purpose (and warns); gem_rbs_collection flattens them onto the module, so annotating
+/// them would grade sentinel on something it deliberately doesn't do.
+fn is_concern_hook(t: &str) -> bool {
+    let t = t.split(" #").next().unwrap_or(t).trim();
+    let head = t.strip_suffix('|').and_then(|_| t.rfind(" do |").map(|i| &t[..i + 3])).unwrap_or(t);
+    matches!(head, "included do" | "prepended do" | "extended do")
+}
+
+/// `Class.new(Base) do`, `Struct.new(:a) do |c|`: a block that defines an anonymous class or module.
+fn opens_anonymous(t: &str) -> bool {
+    if is_concern_hook(t) {
+        return true;
+    }
+    // A trailing comment (`Struct.new(:a) do # :nodoc:`) doesn't change what opens.
+    let t = t.split(" #").next().unwrap_or(t).trim_end();
+    let head = match t.strip_suffix('|') {
+        Some(_) => t.rfind(" do |").map(|i| &t[..i]),
+        None => t.strip_suffix(" do"),
+    };
+    head.is_some_and(|h| h.contains(".new"))
 }
 
 fn indent_of(l: &str) -> usize {
@@ -81,8 +108,9 @@ pub fn annotate(src: &str, index: &RbsIndex) -> Annotated {
 
     // The class a member currently belongs to, and whether we're inside `class << self`.
     let context = |stack: &[Scope]| -> (Option<String>, bool) {
-        let singleton = stack.last().is_some_and(|s| s.name.is_none());
-        (stack.iter().rev().find_map(|s| s.name.clone()), singleton)
+        let singleton = stack.last().is_some_and(|s| s.name.is_none() && !s.anonymous);
+        let owner = stack.iter().rev().find(|s| s.name.is_some() || s.anonymous).and_then(|s| s.name.clone());
+        (owner, singleton)
     };
 
     for (i, line) in lines.iter().enumerate() {
@@ -101,7 +129,7 @@ pub fn annotate(src: &str, index: &RbsIndex) -> Annotated {
                 continue;
             }
             if rest.trim_start().starts_with("<<") {
-                stack.push(Scope { indent: ind, name: None });
+                stack.push(Scope { indent: ind, name: None, anonymous: false });
                 continue;
             }
             let name = rest.split(|c: char| c.is_whitespace() || c == '<' || c == ';').next().unwrap_or("");
@@ -133,7 +161,13 @@ pub fn annotate(src: &str, index: &RbsIndex) -> Annotated {
                     out.push(String::new());
                 }
             }
-            stack.push(Scope { indent: ind, name: Some(qualified) });
+            stack.push(Scope { indent: ind, name: Some(qualified), anonymous: false });
+            continue;
+        }
+
+        if opens_anonymous(t) {
+            stack.push(Scope { indent: ind, name: None, anonymous: true });
+            out.push(line.to_string());
             continue;
         }
 
@@ -333,6 +367,32 @@ end
         assert_eq!(a.count, 1, "{}", a.text);
         assert!(a.text.contains("    #: () -> A\n    def make"));
         assert_eq!(a.expected, "class A\n  def self.make: () -> A\nend\n");
+    }
+
+    #[test]
+    fn members_of_an_anonymous_class_do_not_get_the_enclosing_classs_signatures() {
+        let mut i = RbsIndex::default();
+        i.add_file("class A\n  def initialize: (Integer) -> void\n  def go: () -> void\nend\n");
+        let src = "class A\n  def self.build\n    Class.new(B) do\n      def initialize(x); end\n    end\n  end\n\n  def go; end\nend\n";
+        let a = annotate(src, &i);
+        assert_eq!(a.count, 1, "{}", a.text);
+        assert!(!a.text.contains("(Integer) -> void"), "{}", a.text);
+
+        // A comment after `do` doesn't hide the block.
+        let src = "class A\n  Helper = Struct.new(:x) do # :nodoc:\n    def initialize(x); end\n  end\nend\n";
+        assert_eq!(annotate(src, &i).count, 0, "{}", annotate(src, &i).text);
+        assert!(a.text.contains("#: () -> void\n  def go"), "{}", a.text);
+    }
+
+    #[test]
+    fn concern_hook_bodies_are_left_alone() {
+        let mut i = RbsIndex::default();
+        i.add_file("module M\n  def kept: () -> void\n  def inside: () -> void\nend\n");
+        let src = "module M\n  included do\n    def inside; end\n  end\n\n  def kept; end\nend\n";
+        let a = annotate(src, &i);
+        assert_eq!(a.count, 1, "{}", a.text);
+        assert!(a.text.contains("#: () -> void\n  def kept") && !a.text.contains("#: () -> void\n    def inside"), "{}", a.text);
+        assert!(!a.expected.contains("inside"), "{}", a.expected);
     }
 
     #[test]

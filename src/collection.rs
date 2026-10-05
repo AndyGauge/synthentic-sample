@@ -6,7 +6,7 @@
 //! collection's `.rbs`, which reverse-compiles them into inline annotations.
 
 use crate::{
-    Pair, PairFactory,
+    PairFactory,
     github::{Imported, collect, git},
     pair::ImportOptions,
     settings::{CollectionSettings, GithubSettings},
@@ -67,6 +67,22 @@ pub fn sync(s: &CollectionSettings, gh: &GithubSettings) -> Result<Synced, Strin
     Ok(Synced { gems: list_gems(&root).iter().map(|g| &g.name).collect::<std::collections::BTreeSet<_>>().len(), root, commit })
 }
 
+/// The collection ready to use, with its commit and gem count: freshly synced when `auto_sync`
+/// is on (falling back to an existing checkout if the network is down), else as cached.
+pub fn open(s: &CollectionSettings, gh: &GithubSettings) -> Result<Synced, String> {
+    let root = checkout(s);
+    if s.auto_sync || !root.join("gems").is_dir() {
+        match sync(s, gh) {
+            Ok(synced) => return Ok(synced),
+            Err(e) if root.join("gems").is_dir() => eprintln!("collection sync failed, using cached copy: {e}"),
+            Err(e) => return Err(e),
+        }
+    }
+    let commit = git(gh, &["rev-parse", "--short=7", "HEAD"], Some(&root)).unwrap_or_else(|_| "cached".into());
+    let gems = list_gems(&root).iter().map(|g| &g.name).collect::<std::collections::BTreeSet<_>>().len();
+    Ok(Synced { root, commit, gems })
+}
+
 /// The collection checkout to import from: freshly synced when `auto_sync` is on
 /// (falling back to an existing checkout if the network is down), else as cached.
 pub fn ensure(s: &CollectionSettings, gh: &GithubSettings) -> Result<PathBuf, String> {
@@ -82,7 +98,7 @@ pub fn ensure(s: &CollectionSettings, gh: &GithubSettings) -> Result<PathBuf, St
 }
 
 /// Sort key for dotted versions (`10.0` after `9.1`; non-numeric parts count as 0).
-fn version_key(v: &str) -> Vec<u64> {
+pub(crate) fn version_key(v: &str) -> Vec<u64> {
     v.split('.').map(|p| p.parse().unwrap_or(0)).collect()
 }
 
@@ -223,8 +239,9 @@ pub fn import_gem(
     files.sort_by(|a, b| a.path.cmp(&b.path)); // deterministic
 
     let count = files.len();
-    let pairs: Vec<Pair> = factory.import_files(&label, &files, &ImportOptions { max_lines: gh.max_lines });
-    Ok(Imported { label, pairs, files: count })
+    let opts = ImportOptions { max_lines: gh.max_lines, ruby: gh.check_syntax.then(|| gh.ruby.clone()) };
+    let outcome = factory.import_files(&label, &files, &opts);
+    Ok(Imported { label, pairs: outcome.pairs, files: count, skipped: outcome.skipped, notes: outcome.notes })
 }
 
 /// Imports `gems` with up to `s.jobs` at a time, calling `on_done` (from worker

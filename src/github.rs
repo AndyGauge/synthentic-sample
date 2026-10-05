@@ -3,7 +3,7 @@
 
 use crate::{
     Pair, PairFactory,
-    pair::{ImportOptions, SourceFile},
+    pair::{ImportOptions, ImportOutcome, SourceFile},
     settings::GithubSettings,
 };
 use std::{
@@ -74,6 +74,9 @@ pub struct Imported {
     pub pairs: Vec<Pair>,
     /// Files read (of the factory's extensions).
     pub files: usize,
+    /// Files left out, as `path: reason` (e.g. a split that produced invalid Ruby).
+    pub skipped: Vec<String>,
+    pub notes: Vec<String>,
 }
 
 pub(crate) fn git(settings: &GithubSettings, args: &[&str], dir: Option<&Path>) -> Result<String, String> {
@@ -110,19 +113,19 @@ pub fn import(factory: &dyn PairFactory, spec: &str, settings: &GithubSettings) 
     git(settings, &args, None)?;
     let sha = git(settings, &["rev-parse", "--short=7", "HEAD"], Some(&dest))?;
     let label = format!("{}/{}@{sha}", repo.owner, repo.name);
-    let (pairs, files) = import_dir(factory, &dest, &format!("gh:{label}"), settings);
-    Ok(Imported { label, pairs, files })
+    let (outcome, files) = import_dir(factory, &dest, &format!("gh:{label}"), settings);
+    Ok(Imported { label, pairs: outcome.pairs, files, skipped: outcome.skipped, notes: outcome.notes })
 }
 
 /// Reads the factory's files under `root` and builds pairs. Returns the pairs and
 /// the number of files read. Split out from [`import`] so it can be tested without git.
-pub fn import_dir(factory: &dyn PairFactory, root: &Path, label: &str, settings: &GithubSettings) -> (Vec<Pair>, usize) {
+pub fn import_dir(factory: &dyn PairFactory, root: &Path, label: &str, settings: &GithubSettings) -> (ImportOutcome, usize) {
     let mut files = Vec::new();
     let skip = |name: &str| settings.exclude_dirs.iter().any(|d| d == name);
     collect(root, root, factory.import_extensions(), &skip, settings.max_file_bytes, &mut files);
     files.sort_by(|a, b| a.path.cmp(&b.path)); // deterministic order
-    let pairs = factory.import_files(label, &files, &ImportOptions { max_lines: settings.max_lines });
-    (pairs, files.len())
+    let opts = ImportOptions { max_lines: settings.max_lines, ruby: settings.check_syntax.then(|| settings.ruby.clone()) };
+    (factory.import_files(label, &files, &opts), files.len())
 }
 
 /// Reads files under `dir` with one of `exts` into `out` (paths relative to `root`).
@@ -205,7 +208,8 @@ mod tests {
         w("vendor/bundle/x.rb", "module Shop\n  class Cart\n    def add(i); end\n  end\nend\n");
         w("README.md", "ignored");
 
-        let (pairs, files) = import_dir(&RubyRbsFactory::default(), dir.path(), "gh:a/b@abc1234", &GithubSettings::default());
+        let (outcome, files) = import_dir(&RubyRbsFactory::default(), dir.path(), "gh:a/b@abc1234", &GithubSettings::default());
+        let pairs = outcome.pairs;
         assert_eq!(files, 3, "vendor/ and README are not read");
         assert_eq!(pairs.len(), 1, "only the file with matching signatures: {pairs:#?}");
         let p = &pairs[0];
@@ -215,6 +219,7 @@ mod tests {
         assert!(p.output.contains("#: (String) -> void\n    def add(item)"));
         // Importing again gives identical pairs (stable ids and text).
         let (again, _) = import_dir(&RubyRbsFactory::default(), dir.path(), "gh:a/b@abc1234", &GithubSettings::default());
+        let again = again.pairs;
         assert_eq!((again[0].id.clone(), again[0].output.clone(), again[0].instruction.clone()), (p.id.clone(), p.output.clone(), p.instruction.clone()));
     }
 
@@ -234,7 +239,8 @@ mod tests {
         fs::write(dir.path().join("sig/big.rbs"), &rbs).unwrap();
 
         let s = GithubSettings { max_lines: 30, ..Default::default() };
-        let (pairs, _) = import_dir(&RubyRbsFactory::default(), dir.path(), "gh:a/b@1", &s);
+        let (outcome, _) = import_dir(&RubyRbsFactory::default(), dir.path(), "gh:a/b@1", &s);
+        let pairs = outcome.pairs;
         assert!(pairs.len() > 3, "{}", pairs.len());
         assert!(pairs[0].id.ends_with("big.rb#1"));
         // Every method is annotated exactly once across the hunks.

@@ -58,6 +58,11 @@ pub struct GithubSettings {
     pub exclude_dirs: Vec<String>,
     /// Larger files are skipped.
     pub max_file_bytes: u64,
+    /// Check that every hunk of a split file is valid Ruby, falling back to bigger hunks (and
+    /// finally skipping the file) when it isn't. Uses one warm `ruby` process per thread.
+    pub check_syntax: bool,
+    /// The `ruby` executable used for that check.
+    pub ruby: String,
 }
 
 impl Default for GithubSettings {
@@ -67,6 +72,8 @@ impl Default for GithubSettings {
             max_lines: 120,
             exclude_dirs: [".git", "vendor", "node_modules", "tmp"].map(String::from).to_vec(),
             max_file_bytes: 1_000_000,
+            check_syntax: true,
+            ruby: "ruby".into(),
         }
     }
 }
@@ -105,9 +112,29 @@ impl Default for CollectionSettings {
     }
 }
 
+/// What the scenarios do. See `crate::scenario`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScenarioSettings {
+    /// The scenario selected when the app starts.
+    pub default: String,
+    /// `gem-rbs-collection`: only these gems (empty means every gem in the collection).
+    pub gems: Vec<String>,
+    /// `synthetic`: how many pairs to generate, starting at `synthetic_seed`.
+    pub synthetic_seed: u64,
+    pub synthetic_count: u64,
+}
+
+impl Default for ScenarioSettings {
+    fn default() -> Self {
+        Self { default: "gem-rbs-collection".into(), gems: Vec::new(), synthetic_seed: 0, synthetic_count: 100 }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Settings {
+    pub scenario: ScenarioSettings,
     pub collection: CollectionSettings,
     pub github: GithubSettings,
     /// The transpiler run on each pair's output (`sentinel init`).
@@ -120,8 +147,35 @@ pub struct Settings {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SentinelSettings {
+    /// The command run for `sentinel init` (the fallback compile path), and for
+    /// `sentinel lsp` unless `lsp.command` says otherwise. A scenario replaces it with
+    /// the binary it resolved from `source`.
     pub command: String,
     pub args: Vec<String>,
+    /// Where a scenario gets the sentinel it tests.
+    pub source: SentinelSource,
+    /// For `source = "path"`: the binary to use.
+    pub path: String,
+    /// The gem fetched for `source = "rubygems"`.
+    pub gem_name: String,
+    /// For `source = "git"`: the repository and ref (branch, tag) built with `cargo`.
+    pub git_url: String,
+    pub git_ref: String,
+    pub cargo: String,
+}
+
+/// Where a scenario gets its sentinel binary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SentinelSource {
+    /// Whatever `sentinel.command` resolves to on this machine.
+    Installed,
+    /// The latest published gem: its platform binary is extracted from the `.gem`.
+    Rubygems,
+    /// Clone `git_url` at `git_ref` and `cargo build --release` it: tests unreleased code.
+    Git,
+    /// An explicit binary, `sentinel.path`.
+    Path,
 }
 
 fn args(a: &[&str]) -> Vec<String> {
@@ -142,7 +196,16 @@ impl LspSettings {
 
 impl Default for SentinelSettings {
     fn default() -> Self {
-        Self { command: "sentinel".into(), args: args(&["init"]) }
+        Self {
+            command: "sentinel".into(),
+            args: args(&["init"]),
+            source: SentinelSource::Rubygems,
+            path: String::new(),
+            gem_name: "rbs-sentinel".into(),
+            git_url: "https://github.com/AndyGauge/rbs-sentinel.git".into(),
+            git_ref: "master".into(),
+            cargo: "cargo".into(),
+        }
     }
 }
 

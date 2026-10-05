@@ -4,7 +4,9 @@
 
 use slint::{ComponentHandle, ModelRc, VecModel};
 use slint::SharedString;
-use synthentic_sample::{Settings, Store, collection, highlight::Highlighter, pair::Check, ui::*};
+use synthentic_sample::{
+    Settings, Store, collection, highlight::Highlighter, pair::Check, scenario::{Report, diff}, scenarios, ui::*,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -20,7 +22,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.set_gem_names(ModelRc::new(VecModel::from(gems.iter().map(|g| SharedString::from(g.name.as_str())).collect::<Vec<_>>())));
 
     let checks: Vec<Check> = store.pairs.iter().map(|p| p.check()).collect();
-    let rows: Vec<Row> = store.pairs.iter().zip(&checks).map(|(p, c)| row_for(p, verdict_code(c))).collect();
+
+    // With PREV=previous.jsonl (an earlier run), mark what changed since, as a scenario run would.
+    let mut changes = std::collections::HashMap::new();
+    if let Ok(prev_path) = std::env::var("PREV") {
+        let prev = Store::open(prev_path)?;
+        let (before, now) = (
+            Report::from_pairs("gem-rbs-collection", "0.6.0", &prev.pairs),
+            Report::from_pairs("gem-rbs-collection", "0.6.0+7e95c08", &store.pairs),
+        );
+        let d = diff(&before, &now);
+        for (ids, code) in [(&d.fixed, 1), (&d.regressed, 2), (&d.changed, 3)] {
+            for id in ids {
+                changes.insert(id.clone(), code);
+            }
+        }
+        app.set_alert_text(d.headline().into());
+        app.set_alert_color(slint::Color::from_rgb_u8(0x1a, 0x7f, 0x37));
+        let sc = scenarios::gem_rbs_collection();
+        app.set_scenario_names(ModelRc::new(VecModel::from(vec![SharedString::from(sc.title.as_str())])));
+        app.set_scenario_description(sc.description.as_str().into());
+        let done = [
+            ("sentinel 0.6.0+7e95c08 from git master", 96.5),
+            ("174 gems @ 33602f9", 0.5),
+            ("3433 pairs from 172 gems", 11.7),
+            ("3433 pairs through sentinel (in memory via sentinel lsp)", 2.3),
+            ("3407 of 3433 match the source signatures (99.2%)", 0.1),
+        ];
+        app.set_steps(ModelRc::new(VecModel::from(
+            sc.steps
+                .iter()
+                .zip(done)
+                .map(|(st, (detail, secs))| StepRow { title: st.title().into(), detail: format!("{detail} ({secs:.1}s)").into(), state: 2 })
+                .collect::<Vec<_>>(),
+        )));
+    }
+    let rows: Vec<Row> = store
+        .pairs
+        .iter()
+        .zip(&checks)
+        .map(|(p, c)| row_for(p, verdict_code(c), changes.get(&p.id).copied().unwrap_or(0)))
+        .collect();
     let mismatched = checks.iter().filter(|c| matches!(c, Check::Mismatch(_))).count();
     let matched = checks.iter().filter(|c| **c == Check::Match).count();
     app.set_counts_text(format!("{0} shown of {0} pairs — {matched} match, {mismatched} mismatch", rows.len()).into());

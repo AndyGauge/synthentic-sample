@@ -14,6 +14,9 @@ gpt-oss-120b) that needs to learn a code style it doesn't already know.
 
 - **Generates pairs from a seed.** The same seed gives the same pair on every platform, so a dataset is
   reproducible from `(factory, seed range)`.
+- **Runs scenarios.** A scenario is a workflow: fetch the latest sentinel, sync a source of Ruby, build the
+  pairs, compile them, check the results and diff them with the previous run. One click runs the whole thing,
+  and a human then reviews the pairs with alerts about what sentinel changed (see [Scenarios](#scenarios)).
 - **Is built on an abstract factory.** `PairFactory` is the interface; the Ruby/RBS generator is just one
   implementation. Another language or dialect is another implementation.
 - **Compiles every output through sentinel**, so each row carries the real RBS sentinel produced and any
@@ -25,6 +28,64 @@ gpt-oss-120b) that needs to learn a code style it doesn't already know.
 - **Has a GUI** to generate, read, edit and delete pairs. Changes are saved to a JSONL file five seconds
   after you stop making them.
 
+## Scenarios
+
+![A scenario run: steps with timings, the sentinel diff alert, and a pair whose compiled RBS matches](docs/scenario.png)
+
+A [`PairFactory`](#adding-a-factory) makes pairs from a seed. A **scenario** is the level above: a small
+dependency graph of steps that turns *a sentinel and a source of Ruby* into reviewed pairs. Each step
+produces an artifact (a resolved sentinel binary, the synced collection, the pairs, a report); steps whose
+dependencies are met run in parallel, and steps wrap the factories.
+
+| Scenario | Steps |
+|---|---|
+| `gem-rbs-collection` (default) | **Fetch sentinel** ∥ **Sync gem_rbs_collection** → **Fetch gems, build pairs** → **Compile with sentinel** → **Check against source, diff with last run** |
+| `synthetic` | **Fetch sentinel** → **Generate pairs** → **Compile with sentinel** → **Check, diff with last run** |
+
+Pick a scenario at the top of the window and press **Run scenario**. Each step shows its result and timing as
+it finishes. When the run ends:
+
+- the pairs are **merged into your dataset without overwriting any human work**: new pairs are added, and a
+  pair you haven't touched follows the generator (new instruction, input, output, ground truth and compile
+  result). Each pair remembers a fingerprint of the text the generator produced, so an edit is detected by
+  comparing against it: an edited pair keeps your text, has only `expected` refreshed, and is recompiled with
+  the new sentinel. A pair whose **input** changed (a file split differently under the same id) is a different
+  pair and is replaced outright;
+- **stale pairs** are listed: pairs from a source the run covered (the same gem or repo version) that the run
+  no longer produced. A **Remove N stale pairs** button deletes them; hand-edited and synthetic pairs are never
+  listed;
+- the app switches to the sentinel the run used, so later edits and **Recompile** use it too;
+- an **alert** compares the run with the previous one. For example `sentinel 0.6.0 → 0.7.0: 1188 fixed,
+  0 regressed, 7 changed mismatch`. It turns red when something that used to match no longer does, listing the
+  first regressions and what differs, and each list row is marked ▲ fixed, ▼ regressed or ◆ mismatch changed.
+
+Then review: **show mismatches only** filters to the pairs sentinel got wrong, and you edit those or delete
+them (see [Review](#review-does-the-compiled-rbs-match)).
+
+### Where the sentinel comes from
+
+`sentinel.source` in the [settings](#settings) decides what "fetch sentinel" means:
+
+| `source` | What it does |
+|---|---|
+| `rubygems` (default) | Asks rubygems for the newest published `rbs-sentinel`, downloads the gem, and extracts the binary for this machine from it (cached per version, so a repeat run only asks for the version). If rubygems can't be reached it uses the newest cached one. |
+| `git` | Clones `sentinel.git_url` at `sentinel.git_ref` and runs `cargo build --release`: tests code that hasn't been released yet, e.g. `master`. |
+| `path` | Uses the binary at `sentinel.path`. |
+| `installed` | Uses `sentinel.command` as it is on this machine. |
+
+Whichever it is, the binary is started once to read the version it reports, which also proves it runs.
+
+### Headless, and as a regression test
+
+```sh
+cargo run --release --example scenario -- gem-rbs-collection --out pairs.jsonl
+cargo run --release --example scenario -- gem-rbs-collection --fail-on-regression   # exit 1 if a pair stopped matching
+```
+
+The report from each run is kept in the cache, so the next run (GUI or headless) is compared with it. That
+makes the collection a regression suite for sentinel: a few thousand real files, each with a known-correct
+answer, checked in seconds.
+
 ## Requirements
 
 - A Rust toolchain (edition 2024). The first build compiles Slint and takes a few minutes.
@@ -35,7 +96,9 @@ gpt-oss-120b) that needs to learn a code style it doesn't already know.
   about a millisecond per pair; otherwise the app falls back to running `sentinel init` in a temp directory per pair. The compiled panel says
   which of the two is in use ("compiled in memory via sentinel lsp" or "compiled fallback: sentinel init…").
 - `git`, for syncing the collection and importing from GitHub.
-- `gem` (RubyGems), for downloading gem sources when importing from the collection.
+- `gem` (RubyGems), for downloading gem sources when importing from the collection, and for fetching the
+  latest sentinel (`sentinel.source = "rubygems"`). `tar` extracts the binary from the gem. `cargo` is needed
+  only for `sentinel.source = "git"`.
 
 Importing from the collection needs the network (to sync and to download gems). Developed and tested on macOS. Slint is cross-platform, but nothing else has been tried.
 
@@ -143,6 +206,13 @@ to Ruby by fully-qualified class name, not by file path.
 - `@name: T` (when no attribute already covers it) becomes `# @rbs @name: T` at the top of the class.
 - Files longer than `github.max_lines` (default 120) are split into **hunks** at member boundaries. Each hunk
   is re-wrapped in its `class`/`module` and `end`s so it stands alone, and its id gets a `#n` suffix.
+  Heredoc bodies, `=begin`/`=end` blocks and `__END__` are treated as text, not code, when choosing the cuts.
+- Every hunk that becomes a pair is **checked for valid Ruby** (`github.check_syntax`, on by default). A cut can
+  still land somewhere the heuristics don't understand, so if a split produces an invalid hunk the file is
+  split into bigger hunks, then not at all, and if even the whole file is invalid it is skipped and reported in
+  the import summary. The check uses a **warm worker**: one long-lived `ruby` process per thread that parses
+  each source with Prism, about 0.5 ms per check against about 65 ms for a fresh `ruby -c` each time (3,433
+  hunks take 1.6 s instead of roughly four minutes).
 - Ids look like `ruby-rbs:gem:redis@4.2.5:lib/redis.rb#2` or `ruby-rbs:gh:owner/repo@sha:path/file.rb`, so
   importing the same revision again adds nothing new.
 
@@ -181,11 +251,13 @@ optional; see [`settings.example.json`](settings.example.json) for all of them w
 
 | Key | Controls |
 |---|---|
-| `sentinel.command`, `sentinel.args` | The transpiler (default `sentinel init`), used as the fallback compile path |
+| `sentinel.source`, `sentinel.path`, `sentinel.gem_name`, `sentinel.git_url`, `sentinel.git_ref`, `sentinel.cargo` | Where a scenario gets its sentinel: `rubygems` (default), `git`, `path` or `installed` (see [above](#where-the-sentinel-comes-from)) |
+| `sentinel.command`, `sentinel.args` | The transpiler (default `sentinel init`), used as the fallback compile path and when `source = "installed"`. A scenario replaces it with the binary it fetched |
+| `scenario.default`, `scenario.gems`, `scenario.synthetic_seed`, `scenario.synthetic_count` | The scenario selected at startup; `gem-rbs-collection` limited to these gems (empty means all); the seed range of `synthetic` |
 | `lsp.enabled`, `lsp.command`, `lsp.args` | The language server (default `sentinel lsp`) used for in-memory compile and diagnostics |
 | `highlight.enabled` | `false` gives a plain, selectable text box instead of the highlighted panel |
 | `highlight.theme.*` | `#rrggbb` colours: `background`, `plain`, `comment`, `keyword`, `type`, `builtin`, `ivar`, `function`, `punct`, `string`, `error`, `warning` |
-| `github.git`, `github.max_lines`, `github.exclude_dirs`, `github.max_file_bytes` | The git executable and how imports read a repo or gem |
+| `github.git`, `github.max_lines`, `github.exclude_dirs`, `github.max_file_bytes`, `github.check_syntax`, `github.ruby` | The git executable, how imports read a repo or gem, and whether (and with which `ruby`) split hunks are checked for valid syntax |
 | `collection.url`, `collection.cache_dir`, `collection.gem`, `collection.auto_sync`, `collection.jobs`, `collection.exclude_dirs` | The signature collection: where it lives and is cached, the `gem` executable, whether to sync before each import, parallel downloads, and directories skipped inside an unpacked gem |
 
 The `SENTINEL_BIN` environment variable overrides the sentinel and LSP commands, which is handy for trying a
@@ -217,17 +289,21 @@ crate, so a dependency upgrade can never change what a seed produces.
 
 | Path | What |
 |---|---|
+| `src/scenario.rs` | The workflow model: `Scenario`, `Step`, `Context`, the parallel runner, and `Report`/`Diff` between runs |
+| `src/scenarios.rs` | The built-in scenarios and their steps (fetch sentinel, sync, build pairs, compile, check) |
+| `src/sentinel_source.rs` | Resolving a sentinel from rubygems (extracting its binary from the gem), git, a path, or the installed one |
 | `src/pair.rs` | `Pair`, `PairFactory`, `Compiled`, `Diagnostic` |
 | `src/factories/ruby_rbs.rs` | The Ruby/RBS factory (generation, compile, import) |
 | `src/factories/rbs_reverse.rs` | The reverse annotator (also yields each pair's `expected` RBS) |
-| `src/factories/ruby_hunks.rs` | Splitting long Ruby files into standalone hunks |
+| `src/factories/ruby_hunks.rs` | Splitting long Ruby files into standalone, validated hunks |
+| `src/ruby_syntax.rs` | The warm Ruby syntax-check worker |
 | `src/factories/sentinel.rs`, `src/lsp.rs` | Running `sentinel init` / talking to `sentinel lsp` |
 | `src/collection.rs` | Syncing `gem_rbs_collection`, fetching gem sources, building pairs per gem |
 | `src/rbs.rs` | A small RBS reader and the member-by-member comparison behind the match check |
 | `src/github.rs` | Cloning and reading a repository |
 | `src/highlight.rs`, `src/ui.rs`, `ui/app.slint` | Highlighting and the Slint UI |
 | `src/store.rs`, `src/settings.rs`, `src/rng.rs` | JSONL store, settings, RNG |
-| `examples/import.rs`, `examples/snapshot.rs` | Headless import; render the window to raw RGBA |
+| `examples/scenario.rs`, `examples/import.rs`, `examples/snapshot.rs` | Run a scenario headless; headless import; render the window to raw RGBA |
 
 ## Development
 
@@ -248,7 +324,7 @@ Tests that need sentinel skip themselves when it isn't installed.
   "missing from compiled RBS". Over the whole collection this accounts for every mismatch (see below).
   The pair is best dropped or split until sentinel supports multi-class files.
 - Repos with inline annotations but no `.rbs` files import nothing.
-- Hunking is indentation based, not a parser. A single member longer than `max_lines` stays whole.
+- Hunking is indentation based, not a parser (hunks are validated with Ruby, see above). A single member longer than `max_lines` stays whole.
 - Only the compiled panel is highlighted: the editable Input and Output boxes can't show colours.
 
 ## License

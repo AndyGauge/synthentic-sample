@@ -11,9 +11,26 @@
     "git": "git",
     "max_lines": 120,
     "exclude_dirs": [".git", "vendor", "node_modules", "tmp"],
-    "max_file_bytes": 1000000
+    "max_file_bytes": 1000000,
+    "check_syntax": true,
+    "ruby": "ruby"
   },
-  "sentinel": { "command": "sentinel", "args": ["init"] },
+  "scenario": {
+    "default": "gem-rbs-collection",
+    "gems": [],
+    "synthetic_seed": 0,
+    "synthetic_count": 100
+  },
+  "sentinel": {
+    "command": "sentinel",
+    "args": ["init"],
+    "source": "rubygems",
+    "path": "",
+    "gem_name": "rbs-sentinel",
+    "git_url": "https://github.com/AndyGauge/rbs-sentinel.git",
+    "git_ref": "master",
+    "cargo": "cargo"
+  },
   "lsp": { "enabled": true, "command": "sentinel", "args": ["lsp"] },
   "highlight": {
     "enabled": true,

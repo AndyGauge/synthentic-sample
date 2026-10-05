@@ -25,6 +25,8 @@ pub struct LspClient {
     root_path: PathBuf,
     counter: u64,
     next_id: u64,
+    /// The version the server reported in its `initialize` reply (e.g. `0.7.0`).
+    pub server_version: Option<String>,
 }
 
 impl LspClient {
@@ -52,10 +54,11 @@ impl LspClient {
                 }
             }
         });
-        let mut c = Self { child, stdin, rx, root, root_path, counter: 0, next_id: 1 };
+        let mut c = Self { child, stdin, rx, root, root_path, counter: 0, next_id: 1, server_version: None };
         c.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
             "processId": null, "rootUri": file_uri(&c.root_path), "capabilities": {}}}))?;
-        c.wait(|m| m["id"] == 1)?;
+        let init = c.wait(|m| m["id"] == 1)?;
+        c.server_version = init["result"]["serverInfo"]["version"].as_str().map(String::from);
         c.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}))?;
         Ok(c)
     }

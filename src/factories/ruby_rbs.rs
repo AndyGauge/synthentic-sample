@@ -12,10 +12,11 @@
 use crate::{
     Pair, PairFactory,
     lsp::LspClient,
-    factories::{rbs_reverse, ruby_hunks::split_hunks},
+    factories::{rbs_reverse, ruby_hunks::{split_checked, split_hunks}},
     rbs::RbsIndex,
-    pair::{Compiled, Diagnostic, ImportOptions, SourceFile},
+    pair::{Compiled, Diagnostic, ImportOptions, ImportOutcome, SourceFile},
     rng::{self, Rng},
+    ruby_syntax,
     settings::{LspSettings, SentinelSettings},
 };
 use std::sync::Mutex;
@@ -101,6 +102,7 @@ impl PairFactory for RubyRbsFactory {
             compiled: String::new(),
             compile_error: None,
             diagnostics: Vec::new(),
+            generated: 0,
         }
     }
 
@@ -116,14 +118,39 @@ impl PairFactory for RubyRbsFactory {
     /// Ruby file (or hunk) that has matching signatures becomes a pair whose input
     /// is the plain Ruby and whose output is the same Ruby with inline RBS.
     /// Ruby files with no matching signatures have no ground truth and are skipped.
-    fn import_files(&self, label: &str, files: &[SourceFile], opts: &ImportOptions) -> Vec<Pair> {
+    ///
+    /// Long files are split into hunks; when `opts.ruby` is set each hunk that will
+    /// become a pair is checked with a warm Ruby worker, and a file whose hunks can't
+    /// be made valid Ruby is left out and reported in `skipped`.
+    fn import_files(&self, label: &str, files: &[SourceFile], opts: &ImportOptions) -> ImportOutcome {
         let mut index = RbsIndex::default();
         for f in files.iter().filter(|f| f.path.ends_with(".rbs")) {
             index.add_file(&f.text);
         }
-        let mut pairs = Vec::new();
+        let mut out = ImportOutcome::default();
+        let mut unchecked = false;
         for f in files.iter().filter(|f| f.path.ends_with(".rb")) {
-            let hunks = split_hunks(&f.text, opts.max_lines);
+            let mut relevant = |hunk: &str| rbs_reverse::annotate(hunk, &index).count > 0;
+            let hunks = match &opts.ruby {
+                None => split_hunks(&f.text, opts.max_lines),
+                Some(ruby) => {
+                    let mut valid = |hunk: &str| match ruby_syntax::check_source(ruby, hunk) {
+                        Some(Ok(())) => Ok(()),
+                        Some(Err(e)) => Err(e.to_string()),
+                        None => {
+                            unchecked = true; // no usable Ruby: accept the hunk, and say so below
+                            Ok(())
+                        }
+                    };
+                    match split_checked(&f.text, opts.max_lines, &mut relevant, &mut valid) {
+                        Ok(hunks) => hunks,
+                        Err(why) => {
+                            out.skipped.push(format!("{}: {why}", f.path));
+                            continue;
+                        }
+                    }
+                }
+            };
             for (n, hunk) in hunks.iter().enumerate() {
                 let annotated = rbs_reverse::annotate(hunk, &index);
                 if annotated.count == 0 {
@@ -132,7 +159,7 @@ impl PairFactory for RubyRbsFactory {
                 let suffix = if hunks.len() > 1 { format!("#{}", n + 1) } else { String::new() };
                 let id = format!("{}:{label}:{}{suffix}", self.id(), f.path);
                 let instruction = instruction(&mut Rng::new(rng::hash64(&id)), Style::TypeComment);
-                pairs.push(Pair {
+                out.pairs.push(Pair {
                     id,
                     factory: self.id().into(),
                     seed: 0,
@@ -143,10 +170,14 @@ impl PairFactory for RubyRbsFactory {
                     compiled: String::new(),
                     compile_error: None,
                     diagnostics: Vec::new(),
+                    generated: 0,
                 });
             }
         }
-        pairs
+        if unchecked {
+            out.notes.push("ruby was not available, so hunks were not checked for valid syntax".into());
+        }
+        out
     }
 
     fn compile(&self, source: &str) -> Result<Compiled, String> {

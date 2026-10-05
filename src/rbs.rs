@@ -87,9 +87,15 @@ impl RbsIndex {
                 continue;
             }
             if line.starts_with('|') {
-                if let Some(p) = &mut pending {
+                if let Some(mut p) = pending.take() {
                     p.push(' ');
                     p.push_str(line);
+                    // `| (` can open an overload whose parameters follow on later lines.
+                    if incomplete(&p) {
+                        open = Some(p);
+                    } else {
+                        pending = Some(p);
+                    }
                     continue;
                 }
             }
@@ -261,6 +267,20 @@ end
         // Multi-line signatures are joined.
         assert_eq!(c.methods[&(false, "parse".into())], ["(String, Integer) -> Hash[Symbol, String]"]);
         assert_eq!(c.ivars, [("@count".into(), "Integer".into())]);
+    }
+
+    #[test]
+    fn overload_whose_parameters_start_on_the_next_line_is_not_truncated() {
+        // rubyzip's layout: the second overload opens with `| (` and wraps its parameters.
+        let rbs = "class Zip::File\n  def self.open: [T] (\n      String file_name,\n      ?create: bool\n    ) { (File) -> T } -> T\n                 | (\n      String file_name,\n      ?create: bool\n    ) -> File\n  def other: () -> void\nend\n";
+        let mut i = RbsIndex::default();
+        i.add_file(rbs);
+        let c = &i.classes["Zip::File"];
+        let open = &c.methods[&(true, "open".into())];
+        assert_eq!(open.len(), 2, "{open:?}");
+        assert!(open.iter().all(|sig| !sig.trim_end().ends_with('(')), "{open:?}");
+        // The member after the overload is still seen.
+        assert!(c.methods.contains_key(&(false, "other".into())));
     }
 
     #[test]

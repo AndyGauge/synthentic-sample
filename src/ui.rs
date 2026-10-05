@@ -28,9 +28,9 @@ pub fn verdict_code(check: &Check) -> i32 {
 }
 
 /// One line of the pair list: id plus the first line of the input.
-pub fn row_for(p: &Pair, verdict: i32) -> Row {
+pub fn row_for(p: &Pair, verdict: i32, change: i32) -> Row {
     let first = p.input.lines().next().unwrap_or("");
-    Row { id: p.id.as_str().into(), summary: format!("{}  {first}", p.id).into(), verdict }
+    Row { id: p.id.as_str().into(), summary: format!("{}  {first}", p.id).into(), verdict, change }
 }
 
 /// Pushes a pair's compile result and diagnostics into the compiled panel.
@@ -87,6 +87,6 @@ pub fn clear_compiled(app: &App, hl: &Highlighter) {
     show_compiled(app, &Pair {
         id: String::new(), factory: String::new(), seed: 0, instruction: String::new(),
         input: String::new(), output: String::new(), expected: String::new(), compiled: String::new(),
-        compile_error: None, diagnostics: Vec::new(),
+        compile_error: None, diagnostics: Vec::new(), generated: 0,
     }, hl);
 }

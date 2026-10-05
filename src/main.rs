@@ -16,6 +16,8 @@ use synthentic_sample::{
     highlight::Highlighter,
     pair::{Check, Compiled},
     registry,
+    scenario::{Context, Event},
+    scenarios,
     ui::*,
 };
 
@@ -35,6 +37,10 @@ struct State {
     /// List row → index into `store.pairs`.
     visible: Vec<usize>,
     only_mismatches: bool,
+    /// How the last scenario run changed each pair (see `Row.change`), by pair id.
+    changes: HashMap<String, i32>,
+    /// Pairs the last scenario run no longer produced (see `MergeStats::stale`).
+    stale: Vec<String>,
 }
 
 impl State {
@@ -50,6 +56,11 @@ impl State {
             return 3;
         }
         self.verdicts.get(&p.id).map_or(0, verdict_code)
+    }
+
+    /// 1 fixed, 2 regressed, 3 mismatch changed, 0 no change (in the last scenario run).
+    fn change_code(&self, p: &Pair) -> i32 {
+        self.changes.get(&p.id).copied().unwrap_or(0)
     }
 
     fn is_mismatch(&self, p: &Pair) -> bool {
@@ -77,6 +88,11 @@ enum ImportMsg {
     Pairs { label: String, pairs: Vec<Pair>, files: usize },
     /// Everything is done; re-enables the import controls.
     Finished(String),
+    /// A step of the running scenario started, progressed, finished or failed.
+    Scenario(Event),
+    /// The scenario ran to the end; its pairs, report and diff are in the context.
+    ScenarioDone(Box<Context>),
+    ScenarioFailed(String),
 }
 
 /// What the import box was asked for.
@@ -108,6 +124,51 @@ fn sync_pending(app: &App, s: &State) {
     app.set_pending_compiles(s.pending.values().sum::<usize>() as i32);
     let selected = s.selected.and_then(|i| s.store.pairs.get(i));
     app.set_compiling(selected.is_some_and(|p| s.pending.contains_key(&p.id)));
+}
+
+/// Shows what a scenario run found: the sentinel diff against the previous run, with the
+/// regressions spelled out, or a note that this run is now the baseline.
+fn show_alert(app: &App, ctx: &Context, s: &State) {
+    let color = |r, g, b| slint::Color::from_rgb_u8(r, g, b);
+    let (red, green, gray) = (color(0xcf, 0x22, 0x2e), color(0x1a, 0x7f, 0x37), color(0x57, 0x60, 0x6a));
+    let first_mismatch = |id: &str| {
+        s.store
+            .pairs
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(|p| match p.check() {
+                Check::Mismatch(lines) => lines.into_iter().next(),
+                _ => None,
+            })
+            .unwrap_or_default()
+    };
+    let (text, tint, lines): (String, slint::Color, Vec<Diag>) = match (&ctx.diff, &ctx.report) {
+        (Some(d), _) => {
+            let mut lines = Vec::new();
+            for id in d.regressed.iter().take(8) {
+                lines.push(Diag { text: format!("▼ {id}\n   {}", first_mismatch(id)).into(), color: red });
+            }
+            if d.regressed.len() > 8 {
+                lines.push(Diag { text: format!("… and {} more regressions", d.regressed.len() - 8).into(), color: red });
+            }
+            if d.regressed.is_empty() {
+                for id in d.changed.iter().take(3) {
+                    lines.push(Diag { text: format!("◆ mismatch changed: {id}").into(), color: gray });
+                }
+            }
+            let tint = if d.is_alarming() { red } else if !d.fixed.is_empty() { green } else { gray };
+            (d.headline(), tint, lines)
+        }
+        (None, Some(r)) => (
+            format!("First run of this scenario: baseline saved ({} of {} checked pairs match)", r.matched, r.matched + r.mismatched),
+            gray,
+            Vec::new(),
+        ),
+        (None, None) => (String::new(), gray, Vec::new()),
+    };
+    app.set_alert_text(text.into());
+    app.set_alert_color(tint);
+    app.set_alert_lines(ModelRc::new(VecModel::from(lines)));
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -151,6 +212,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         verdicts,
         visible: Vec::new(),
         only_mismatches: false,
+        changes: HashMap::new(),
+        stale: Vec::new(),
     }));
     let timer = Rc::new(Timer::default());
 
@@ -195,7 +258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .filter(|&i| !s.only_mismatches || s.is_mismatch(&s.store.pairs[i]))
                 .collect();
             let new_rows: Vec<Row> =
-                visible.iter().map(|&i| row_for(&s.store.pairs[i], s.verdict_code(&s.store.pairs[i]))).collect();
+                visible.iter().map(|&i| row_for(&s.store.pairs[i], s.verdict_code(&s.store.pairs[i]), s.change_code(&s.store.pairs[i]))).collect();
             if visible == s.visible {
                 for (k, row) in new_rows.into_iter().enumerate() {
                     if rows.row_data(k).as_ref() != Some(&row) {
@@ -298,11 +361,129 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Imports clone and download, so they run off the UI thread and stream results back.
     let (import_tx, import_rx) = mpsc::channel::<ImportMsg>();
 
+    // ---- scenarios -----------------------------------------------------------------
+    let steps = Rc::new(VecModel::<StepRow>::default());
+    app.set_steps(ModelRc::from(steps.clone()));
+    let step_ids: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let scenario_list = scenarios::all();
+    app.set_scenario_names(ModelRc::new(VecModel::from(
+        scenario_list.iter().map(|sc| SharedString::from(sc.title.as_str())).collect::<Vec<_>>(),
+    )));
+    let default_index = scenario_list.iter().position(|sc| sc.id == settings.scenario.default).unwrap_or(0);
+    app.set_scenario_index(default_index as i32);
+
+    // Shows a scenario's description and its steps, all pending.
+    let reset_steps = {
+        let (steps, step_ids, app) = (steps.clone(), step_ids.clone(), app.as_weak());
+        Rc::new(move |index: usize| {
+            let (Some(app), all) = (app.upgrade(), scenarios::all()) else { return };
+            let Some(sc) = all.get(index) else { return };
+            app.set_scenario_description(sc.description.as_str().into());
+            *step_ids.borrow_mut() = sc.steps.iter().map(|st| st.id().to_string()).collect();
+            steps.set_vec(
+                sc.steps
+                    .iter()
+                    .map(|st| StepRow { title: st.title().into(), detail: "".into(), state: 0 })
+                    .collect::<Vec<_>>(),
+            );
+            app.set_alert_text("".into());
+        })
+    };
+    reset_steps(default_index);
+
+    // Folds a finished run into the dataset (never overwriting a human edit), switches the
+    // app to the sentinel the run used, and raises the diff alert.
+    let apply_scenario = {
+        let (state, app, queue, refresh, save) =
+            (state.clone(), app.as_weak(), queue.clone(), refresh.clone(), schedule_save.clone());
+        Rc::new(move |ctx: Box<Context>| {
+            let Some(app) = app.upgrade() else { return };
+            let ctx = *ctx;
+            let effective = ctx.effective_settings();
+            let stats = {
+                let mut s = state.borrow_mut();
+                // Later compiles (edits, Recompile) use the sentinel the run tested.
+                s.factories = registry(&effective).into_iter().map(Arc::from).collect();
+                s.changes.clear();
+                if let Some(d) = &ctx.diff {
+                    for (ids, code) in [(&d.fixed, 1), (&d.regressed, 2), (&d.changed, 3)] {
+                        for id in ids {
+                            s.changes.insert(id.clone(), code);
+                        }
+                    }
+                }
+                let stats = s.store.merge(ctx.pairs.clone());
+                s.stale = stats.stale.clone();
+                app.set_stale_count(s.stale.len() as i32);
+                for p in &ctx.pairs {
+                    s.recheck(&p.id);
+                }
+                show_alert(&app, &ctx, &s);
+                stats
+            };
+            for id in &stats.recompile {
+                queue(id);
+            }
+            save();
+            refresh();
+            app.set_status(
+                format!(
+                    "scenario finished: {} new pairs, {} refreshed, {} replaced (input changed), {} human-edited kept{}{}",
+                    stats.added,
+                    stats.updated,
+                    stats.replaced,
+                    stats.kept_edited,
+                    if stats.kept_edited > 0 { " (recompiling them)" } else { "" },
+                    if stats.stale.is_empty() { String::new() } else { format!("; {} stale pairs can be removed", stats.stale.len()) }
+                )
+                .into(),
+            );
+        })
+    };
+
+    app.on_scenario_selected({
+        let (app, reset) = (app.as_weak(), reset_steps.clone());
+        move |index| {
+            if let Some(app) = app.upgrade() {
+                if !app.get_importing() {
+                    reset(index as usize);
+                }
+            }
+        }
+    });
+
+    app.on_run_scenario({
+        let (app, reset, tx, base) = (app.as_weak(), reset_steps.clone(), import_tx.clone(), settings.clone());
+        move |index| {
+            let Some(app) = app.upgrade() else { return };
+            let Some(id) = scenarios::all().get(index as usize).map(|sc| sc.id) else { return };
+            if app.get_importing() {
+                return;
+            }
+            reset(index as usize);
+            app.set_importing(true);
+            app.set_status("running scenario…".into());
+            let (tx, settings) = (tx.clone(), base.clone());
+            thread::spawn(move || {
+                let scenario = scenarios::find(id).expect("listed scenario");
+                // Each run starts from the configured settings, so the sentinel is resolved afresh.
+                let result = scenario.run(Context::new(settings), &|event| {
+                    let _ = tx.send(ImportMsg::Scenario(event));
+                });
+                let _ = tx.send(match result {
+                    Ok(ctx) => ImportMsg::ScenarioDone(Box::new(ctx)),
+                    Err(e) => ImportMsg::ScenarioFailed(e.to_string()),
+                });
+            });
+        }
+    });
+
     let poll = Timer::default();
     poll.start(TimerMode::Repeated, Duration::from_millis(30), {
         let (state, app, hl, save) = (state.clone(), app.as_weak(), hl.clone(), schedule_save.clone());
         let (add_pairs, queue, refresh) = (add_pairs.clone(), queue.clone(), refresh.clone());
         let collection_settings = settings.collection.clone();
+        let (steps, step_ids, apply_scenario) = (steps.clone(), step_ids.clone(), apply_scenario.clone());
         move || {
             let Some(app) = app.upgrade() else { return };
             let mut touched = false;
@@ -329,6 +510,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.set_importing(false);
                         app.set_status(text.into());
                         load_gem_names(&app, &collection_settings); // a sync may have added gems
+                    }
+                    ImportMsg::Scenario(event) => {
+                        let (step, update): (String, Box<dyn FnOnce(&mut StepRow)>) = match event {
+                            Event::Started { step, .. } => (step, Box::new(|r| r.state = 1)),
+                            Event::Progress { step, text } => (step, Box::new(move |r| r.detail = text.into())),
+                            Event::Finished { step, summary, millis } => (
+                                step,
+                                Box::new(move |r| {
+                                    r.state = 2;
+                                    r.detail = format!("{summary} ({:.1}s)", millis as f64 / 1000.0).into();
+                                }),
+                            ),
+                            Event::Failed { step, error } => (
+                                step,
+                                Box::new(move |r| {
+                                    r.state = 3;
+                                    r.detail = error.into();
+                                }),
+                            ),
+                        };
+                        let position = step_ids.borrow().iter().position(|id| *id == step);
+                        if let Some(i) = position {
+                            if let Some(mut row) = steps.row_data(i) {
+                                update(&mut row);
+                                steps.set_row_data(i, row);
+                            }
+                        }
+                    }
+                    ImportMsg::ScenarioDone(ctx) => {
+                        app.set_importing(false);
+                        apply_scenario(ctx);
+                        touched = true;
+                    }
+                    ImportMsg::ScenarioFailed(error) => {
+                        app.set_importing(false);
+                        app.set_status(format!("scenario failed: {error}").into());
                     }
                 }
             }
@@ -548,6 +765,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    app.on_remove_stale({
+        let (app, state, show, refresh, save) = (app.as_weak(), state.clone(), show.clone(), refresh.clone(), schedule_save.clone());
+        move || {
+            let Some(app) = app.upgrade() else { return };
+            let removed = {
+                let mut s = state.borrow_mut();
+                let ids = std::mem::take(&mut s.stale);
+                let selected_id = s.selected.and_then(|i| s.store.pairs.get(i)).map(|p| p.id.clone());
+                let n = s.store.remove(&ids);
+                for id in &ids {
+                    s.verdicts.remove(id);
+                    s.changes.remove(id);
+                }
+                // Indices shifted: find the selected pair again, if it survived.
+                s.selected = selected_id.and_then(|id| s.store.pairs.iter().position(|p| p.id == id));
+                n
+            };
+            app.set_stale_count(0);
+            refresh();
+            show();
+            if removed > 0 {
+                save();
+            }
+            app.set_status(format!("removed {removed} stale pairs").into());
+        }
+    });
+
     // Edits: write through to the store, then debounce a save.
     macro_rules! on_edit {
         ($setter:ident, $field:ident) => { on_edit!($setter, $field, |_: &Rc<RefCell<State>>| {}) };
@@ -571,6 +815,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.on_recompile({
         let queue_selected = queue_selected.clone();
         move || queue_selected()
+    });
+    // Recompile every pair currently in the list (respects "show mismatches only").
+    app.on_recompile_shown({
+        let (state, queue, refresh) = (state.clone(), queue.clone(), refresh.clone());
+        move || {
+            let ids: Vec<String> = {
+                let s = state.borrow();
+                s.visible.iter().filter_map(|&i| s.store.pairs.get(i)).map(|p| p.id.clone()).collect()
+            };
+            for id in &ids {
+                queue(id);
+            }
+            refresh();
+        }
     });
     // Recompile shortly after the user stops typing in the output panel.
     let compile_timer = Rc::new(Timer::default());

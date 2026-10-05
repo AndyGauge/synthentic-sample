@@ -33,6 +33,11 @@ pub struct Pair {
     /// Language-server diagnostics for `output`; a non-empty list marks a suspect row.
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
+    /// [`Pair::fingerprint`] of the text as a factory generated it, recorded when a scenario
+    /// stores the pair. A pair whose text no longer hashes to this was edited by a person.
+    /// 0 means unknown (a pair stored before this existed).
+    #[serde(default)]
+    pub generated: u64,
 }
 
 /// A file read from a checked-out repository.
@@ -48,6 +53,19 @@ pub struct SourceFile {
 pub struct ImportOptions {
     /// Files longer than this are split into hunks of at most this many lines.
     pub max_lines: usize,
+    /// The `ruby` command used to check that hunks are valid Ruby (a split can cut a file
+    /// somewhere it can't be cut). `None` skips the check.
+    pub ruby: Option<String>,
+}
+
+/// What an import produced, and what it had to leave out.
+#[derive(Debug, Default)]
+pub struct ImportOutcome {
+    pub pairs: Vec<Pair>,
+    /// Files left out of the import, as `path: reason`.
+    pub skipped: Vec<String>,
+    /// Things worth telling the user, e.g. that hunks could not be syntax-checked.
+    pub notes: Vec<String>,
 }
 
 /// What a factory's compiler produced for a source.
@@ -85,6 +103,16 @@ impl Pair {
             m if m.is_empty() => Check::Match,
             m => Check::Mismatch(m),
         }
+    }
+
+    /// Hash of the text a person can edit: instruction, input and output.
+    pub fn fingerprint(&self) -> u64 {
+        crate::rng::hash64(&format!("{}\0{}\0{}", self.instruction, self.input, self.output))
+    }
+
+    /// Records the current text as the generator's, so later edits can be told apart from it.
+    pub fn stamp(&mut self) {
+        self.generated = self.fingerprint();
     }
 
     pub fn make_id(factory: &str, seed: u64) -> String {
@@ -130,8 +158,8 @@ pub trait PairFactory: Send + Sync {
     /// per file, or per hunk when a file is longer than `opts.max_lines`. Gets
     /// every file so it can relate them (e.g. Ruby sources to their `.rbs`).
     /// Pair ids must be unique and stable for a given revision.
-    fn import_files(&self, _label: &str, _files: &[SourceFile], _opts: &ImportOptions) -> Vec<Pair> {
-        Vec::new()
+    fn import_files(&self, _label: &str, _files: &[SourceFile], _opts: &ImportOptions) -> ImportOutcome {
+        ImportOutcome::default()
     }
 
     /// A short note on how `compile` is currently being done, for the UI (e.g. which
